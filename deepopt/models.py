@@ -643,7 +643,8 @@ class DeepoptBaseModel(ABC):
 
         if risk_measure:
             assert acq_method != "MaxValEntropy", "Risk measure not yet supported for MaxValueEntropy acquisition"
-            x_stddev_scaled = x_stddev.to(self.bounds.device) / (self.bounds[1] - self.bounds[0])
+            x_stddev = torch.tensor(x_stddev,dtype=torch.float,device=self.bounds.device)
+            x_stddev_scaled = x_stddev / (self.bounds[1] - self.bounds[0])
             bounds_scaled = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float).T
             if self.multi_fidelity:
                 x_stddev_scaled[-1] = 0
