@@ -28,7 +28,6 @@ from botorch.models.deterministic import DeterministicModel
 from botorch.models.gp_regression_fidelity import SingleTaskGP, SingleTaskMultiFidelityGP
 from botorch.models.model import Model
 from botorch.models.transforms.input import InputPerturbation
-from botorch.models.transforms.outcome import Standardize
 from botorch.optim.optimize import optimize_acqf, optimize_acqf_mixed
 from botorch.sampling.qmc import MultivariateNormalQMCEngine
 from botorch.sampling.samplers import SobolQMCNormalSampler
@@ -44,6 +43,7 @@ from deepopt.configuration import ConfigSettings
 from deepopt.defaults import Defaults
 from deepopt.deltaenc import DeltaEnc
 from deepopt.nn_ensemble import NNEnsemble
+from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
@@ -161,6 +161,12 @@ class DeepoptBaseModel(ABC):
         self.input_dim = self.full_train_X.size(-1)
         self.output_dim = self.full_train_Y.shape[-1]
         assert self.output_dim == 1, "Multi-output models not currently supported."
+        self.output_scaler = OutputScaler(
+            multi_fidelity=self.multi_fidelity,
+            num_fidelities=self.num_fidelities,
+            fidelity_dim=self.input_dim - 1,
+        ).fit(self.full_train_Y, self.full_train_X)
+        self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
         self.target_fidelities = {self.input_dim - 1: self.num_fidelities - 1}
 
         # TODO: when running single fidelity with deluq, should n_epochs be set to 1000?
@@ -471,10 +477,7 @@ class DeepoptBaseModel(ABC):
                 return candidates, acq_value
 
         if acq_method == "EI":
-            if hasattr(model,'out_scaler') and hasattr(model,'y_max') and hasattr(model,'y_min'):
-                max_y = model.out_scaler(self.full_train_Y.max(),model.y_min,model.y_max).item()
-            else:
-                max_y = self.full_train_Y.max().item()
+            max_y = self.full_train_Y_scaled.max().item()
             q_acq = qExpectedImprovement(model, max_y, objective=risk_objective)
         elif acq_method == "NEI":
             q_acq = qNoisyExpectedImprovement(model, self.full_train_X, objective=risk_objective, prune_baseline=True)
@@ -679,6 +682,44 @@ class DeepoptBaseModel(ABC):
         np.save(outfile, candidates_npy)
 
 
+class DeepOptGPMixin:
+    """
+    Shared prediction API for GP models trained in scaled output units.
+    """
+
+    def get_prediction_with_uncertainty(
+        self,
+        q: torch.Tensor,
+        get_cov: bool = False,
+        original_scale: bool = True,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return GP posterior mean and variance or covariance.
+        """
+        posterior = self.posterior(q, **kwargs)
+        mean = posterior.mean
+        if get_cov:
+            cov = posterior.mvn.covariance_matrix
+            if original_scale:
+                mean = self.output_scaler.inverse_transform(mean, q)
+                cov = self.output_scaler.inverse_covariance(cov, q)
+            return mean.squeeze(-1), cov
+        variance = posterior.variance
+        if original_scale:
+            mean = self.output_scaler.inverse_transform(mean, q)
+            variance = self.output_scaler.inverse_variance(variance, q)
+        return mean, variance
+
+
+class DeepOptSingleTaskGP(DeepOptGPMixin, SingleTaskGP):
+    pass
+
+
+class DeepOptSingleTaskMultiFidelityGP(DeepOptGPMixin, SingleTaskMultiFidelityGP):
+    pass
+
+
 class GPModel(DeepoptBaseModel):
     """
     DeepOpt's GP model representation. This class is where we'll
@@ -703,20 +744,20 @@ class GPModel(DeepoptBaseModel):
         mll: ExactMarginalLogLikelihood = None
 
         if self.multi_fidelity:
-            model = SingleTaskMultiFidelityGP(
+            model = DeepOptSingleTaskMultiFidelityGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
                 data_fidelity=self.input_dim - 1,
             )
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
         else:
-            model = SingleTaskGP(self.full_train_X, self.full_train_Y, outcome_transform=Standardize(m=1))
+            model = DeepOptSingleTaskGP(self.full_train_X, self.full_train_Y_scaled)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        model.output_scaler = self.output_scaler
 
         fit_gpytorch_model(mll)
 
-        state = {"state_dict": model.state_dict()}
+        state = {"state_dict": model.state_dict(), "output_scaler": self.output_scaler.state_dict()}
         torch.save(state, join(getcwd(), dirname(outfile), basename(outfile)))
         return model
 
@@ -731,21 +772,33 @@ class GPModel(DeepoptBaseModel):
         """
 
         model: Union[SingleTaskGP, SingleTaskMultiFidelityGP] = None
+        state_dict = torch.load(learner_file, map_location=self.device)
+        if "output_scaler" in state_dict:
+            self.output_scaler = OutputScaler.from_state_dict(state_dict["output_scaler"], device=self.device)
+            self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
+        elif any(key.startswith("outcome_transform.") for key in state_dict["state_dict"]):
+            raise RuntimeError(
+                "This GP checkpoint was trained with the previous Standardize outcome transform and cannot "
+                "be loaded into the new DeepOpt min/max output-scaling path. Retrain the GP checkpoint."
+            )
+        else:
+            warnings.warn(
+                "GP checkpoint has no output_scaler state; using scaler fit from the current data file.",
+                RuntimeWarning,
+            )
 
         if self.multi_fidelity:
-            model = SingleTaskMultiFidelityGP(
+            model = DeepOptSingleTaskMultiFidelityGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
                 data_fidelity=self.input_dim - 1,
             )
         else:
-            model = SingleTaskGP(
+            model = DeepOptSingleTaskGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
             )
-        state_dict = torch.load(learner_file)
+        model.output_scaler = self.output_scaler
         model.load_state_dict(state_dict["state_dict"])
         return model
 
@@ -808,6 +861,7 @@ class DelUQModel(DeepoptBaseModel):
                     y_train=y_train,
                     target=self.target,
                     multi_fidelity=self.multi_fidelity,
+                    output_scaler=self.output_scaler,
                 )
                 model.train()
                 model.fit()
@@ -815,13 +869,7 @@ class DelUQModel(DeepoptBaseModel):
             model.eval()
             with torch.no_grad():  # TODO: is this needed?
                 for _, (X_test, y_test) in enumerate(test_loader):
-                    if self.multi_fidelity:
-                        test_fid_locs = [X_test[..., -1] == i for i in model.X_train[..., -1].unique()]
-                        y_test_scaled = y_test.clone()
-                        for fid_loc, y_min, y_max in zip(test_fid_locs, model.y_min, model.y_max):
-                            y_test_scaled[fid_loc] = model.out_scaler(y_test_scaled[fid_loc], y_min, y_max)
-                    else:
-                        y_test_scaled = model.out_scaler(y_test, model.y_min, model.y_max)
+                    y_test_scaled = self.output_scaler.transform(y_test, X_test)
                     y_pred, _ = model.get_prediction_with_uncertainty(X_test, original_scale=False)
                     cv_score += cv_loss_fun(y_test_scaled, y_pred)
 
@@ -897,6 +945,7 @@ class DelUQModel(DeepoptBaseModel):
             y_train=self.full_train_Y,
             target=self.target,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
         )
 
         model.fit()
@@ -933,6 +982,7 @@ class DelUQModel(DeepoptBaseModel):
             y_train=self.full_train_Y,
             target=self.target,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
         )
 
         # DeltaEnc model requries the parent path and file name to be separated.
@@ -976,6 +1026,7 @@ class NNEnsembleModel(DeepoptBaseModel):
             X_train=self.full_train_X,
             y_train=self.full_train_Y,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
             verbose=self.verbose,
         )
 
@@ -1013,6 +1064,7 @@ class NNEnsembleModel(DeepoptBaseModel):
             X_train=self.full_train_X,
             y_train=self.full_train_Y,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
             verbose=self.verbose
         )
 

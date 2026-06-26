@@ -19,6 +19,7 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 from deepopt.configuration import ConfigSettings
+from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
@@ -42,6 +43,7 @@ class NNEnsemble(Model):
         multi_fidelity: bool = False,
         fantasy_dict: dict = None,
         verbose: bool = False,
+        output_scaler: OutputScaler = None,
     ):
         """
         Initialize an instance of the `NNEnsemble` model for further processing.
@@ -86,27 +88,23 @@ class NNEnsemble(Model):
         self._batch_shape = batch_shape
         self.n_train = X_train.shape[-2]
 
-        self.out_scaler = lambda y, y_min, y_max: (y - y_min) / (y_max - y_min)
-        self.out_scaler_inv = lambda y, y_min, y_max: y * (y_max - y_min) + y_min
+        if output_scaler is None:
+            output_scaler = OutputScaler(
+                multi_fidelity=self.multi_fidelity,
+                num_fidelities=int(X_train[..., -1].max().item()) + 1 if self.multi_fidelity else 1,
+                fidelity_dim=self.input_dim - 1,
+            ).fit(y_train, X_train)
+        self.output_scaler = output_scaler.to(self.device)
+        self.y_min = self.output_scaler.y_min
+        self.y_max = self.output_scaler.y_max
+        self.out_scaler = lambda y, y_min, y_max: (y - y_min) / torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min))
+        self.out_scaler_inv = lambda y, y_min, y_max: y * torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min)) + y_min
 
         if self.multi_fidelity:
             self.train_fid_locs = [X_train[..., -1] == i for i in X_train[..., -1].unique()]
-            y_train_by_fid = [y_train[fid_loc] for fid_loc in self.train_fid_locs]
 
-            self.y_max = [Y.max().detach() for Y in y_train_by_fid] if not hasattr(self,'y_max') else self.y_max
-            self.y_min = [Y.min().detach() for Y in y_train_by_fid] if not hasattr(self,'y_min') else self.y_min
-
-            self.X_train_scaled = X_train.clone()
-            self.y_train_scaled = y_train.clone()
-
-            for fid_loc, y_min, y_max in zip(self.train_fid_locs, self.y_min, self.y_max):
-                self.y_train_scaled[fid_loc] = self.out_scaler(self.y_train_scaled[fid_loc], y_min, y_max)
-        else:
-            self.y_max = y_train.max().detach() if not hasattr(self,'y_max') else self.y_max
-            self.y_min = y_train.min().detach() if not hasattr(self,'y_min') else self.y_min
-
-            self.X_train_scaled = X_train.clone()
-            self.y_train_scaled = self.out_scaler(y_train.clone(), self.y_min, self.y_max)
+        self.X_train_scaled = X_train.clone()
+        self.y_train_scaled = self.output_scaler.transform(y_train.clone(), X_train)
 
         self.X_train_nn = self.X_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
         self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
@@ -268,6 +266,7 @@ class NNEnsemble(Model):
         state["state_dict"] = [f_pred.state_dict() for f_pred in self.f_predictor]
         state["B"] = [f_pred.B for f_pred in self.f_predictor]
         state["opt_state_dict"] = [opt.state_dict() for opt in self.f_optimizer]
+        state["output_scaler"] = self.output_scaler.state_dict()
         filename = path + "/" + name + ".ckpt"
         torch.save(state, filename)
         print("Saved Ckpts")
@@ -280,6 +279,17 @@ class NNEnsemble(Model):
         :param name: The name of the checkpoint file
         """
         saved_state = torch.load(os.path.join(path, name + ".ckpt"), map_location=self.device)
+        if "output_scaler" in saved_state:
+            self.output_scaler = OutputScaler.from_state_dict(saved_state["output_scaler"], device=self.device)
+            self.y_min = self.output_scaler.y_min
+            self.y_max = self.output_scaler.y_max
+        else:
+            warnings.warn(
+                "NNEnsemble checkpoint has no output_scaler state; using scaler fit from the current data file.",
+                RuntimeWarning,
+            )
+        self.y_train_scaled = self.output_scaler.transform(self.y_train.clone(), self.X_train)
+        self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
         for f_pred,state_dict,B in zip(self.f_predictor,saved_state["state_dict"],saved_state["B"]):
             f_pred.load_state_dict(state_dict)
             f_pred.B = B
@@ -349,7 +359,7 @@ class NNEnsemble(Model):
                     means_squeeze = torch.tensor([means_squeeze],dtype=torch.float,device=self.device)
                 if variances_squeeze.ndim == 0:
                     variances_squeeze = torch.tensor([variances_squeeze],dtype=torch.float,device=self.device)
-                mvn = MultivariateNormal(means_squeeze, torch.diag(variances_squeeze + 1e-6,device=self.device))
+                mvn = MultivariateNormal(means_squeeze, torch.diag(variances_squeeze + 1e-6))
             else:
                 covar_diag = variances.squeeze(-1) + 1e-6
                 covars = torch.zeros(*covar_diag.shape, covar_diag.shape[-1],device=self.device)
@@ -402,9 +412,6 @@ class NNEnsemble(Model):
         ), f"Expected tensor to have batch shape matching training batch shape {self.batch_shape}, instead found "
         f"tensor of shape {q.shape}."
         input_shape = q.shape
-        if self.multi_fidelity:
-            test_fid_locs = [q[..., -1] == i for i in self.X_train[..., -1].unique()]
-
         q_move = q.moveaxis(-2, 0)
         samples_shape = q_move.shape[: -len(self.batch_shape) - 1]
 
@@ -419,12 +426,7 @@ class NNEnsemble(Model):
         assert val.shape[1:-1] == input_shape[:-1], "Something went wrong with reshaping."
 
         if original_scale:
-            if self.multi_fidelity:
-                all_preds = torch.zeros_like(val)
-                for fid_loc, ymin, ymax in zip(test_fid_locs, self.y_min, self.y_max):
-                    all_preds[:, fid_loc] = self.out_scaler_inv(val[:, fid_loc], ymin, ymax)
-            else:
-                all_preds = self.out_scaler_inv(val, self.y_min, self.y_max)
+            all_preds = self.output_scaler.inverse_transform(val, q)
         else:
             all_preds = val
 
@@ -464,12 +466,7 @@ class NNEnsemble(Model):
             post_X = self.posterior(X, **kwargs)
             Y_fantasized = sampler(post_X)
             
-        if self.multi_fidelity:
-            X_fid_locs = [X[..., -1] == i for i in self.X_train[..., -1].unique()]
-            for fid_loc, ymin, ymax in zip(X_fid_locs, self.y_min, self.y_max):
-                Y_fantasized[:,fid_loc] = self.out_scaler_inv(Y_fantasized[:,fid_loc].detach().clone(), ymin, ymax)
-        else:
-            Y_fantasized = self.out_scaler_inv(Y_fantasized.detach().clone(),self.y_min,self.y_max)
+        Y_fantasized = self.output_scaler.inverse_transform(Y_fantasized.detach().clone(), X)
         num_fantasies = Y_fantasized.shape[0]
         X_clone = X.detach().clone()
 
@@ -519,7 +516,8 @@ class NNEnsemble(Model):
                 y_train=Y_train,
                 multi_fidelity=self.multi_fidelity,
                 fantasy_dict=fantasy_dict,
-                verbose=self.verbose)
+                verbose=self.verbose,
+                output_scaler=self.output_scaler)
             if hasattr(self, "input_transform"):
                 fantasy_model.input_transform = self.input_transform
                 
