@@ -5,7 +5,7 @@ neural networks.
 import os
 import warnings
 from copy import copy
-from typing import Any, Callable, Tuple, Type, Union
+from typing import Any, Callable, Dict, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -234,7 +234,7 @@ class DeltaEnc(Model):
                     self.f_optimizer.step()
                     avg_loss += f_loss.item() / len(loader)
 
-    def save_ckpt(self, path: str, name: str):
+    def save_ckpt(self, path: str, name: str, checkpoint_metadata: Dict[str, Any] = None):
         """
         Save a trained model to a checkpoint file
 
@@ -246,6 +246,8 @@ class DeltaEnc(Model):
         state["B"] = self.f_predictor.B
         state["opt_state_dict"] = self.f_optimizer.state_dict()
         state["output_scaler"] = self.output_scaler.state_dict()
+        if checkpoint_metadata is not None:
+            state["deepopt_checkpoint"] = checkpoint_metadata
         filename = path + "/" + name + ".ckpt"
         torch.save(state, filename)
         print("Saved Ckpts")

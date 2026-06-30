@@ -1,13 +1,14 @@
 import numpy as np
 from click.testing import CliRunner
 import pytest
+import torch
 
 pytest.importorskip("botorch")
 pytest.importorskip("gpytorch")
 pytest.importorskip("ray")
 
 from deepopt.deepopt_cli import deepopt_cli, get_deepopt_model
-from deepopt.models import DelUQModel, GPModel, NNEnsembleModel
+from deepopt.models import DEEPOPT_CHECKPOINT_KEY, DelUQModel, GPModel, NNEnsembleModel
 
 pytestmark = pytest.mark.requires_botorch
 
@@ -164,19 +165,87 @@ def test_conditional_option_is_ignored_when_dependency_missing(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Option fidelity_cost will not be used" in result.output
-    assert "Option integer_fidelities will not be used" in result.output
     assert "Option risk_level will not be used" in result.output
     assert "Option risk_n_deltas will not be used" in result.output
     assert "Option x_stddev will not be used" in result.output
     assert len(calls) == 1
     kwargs = calls[0]
     assert kwargs["fidelity_cost"] is None
-    assert kwargs["integer_fidelities"] is None
+    assert kwargs["integer_fidelities"] is False
     assert kwargs["risk_measure"] is None
     assert kwargs["risk_level"] is None
     assert kwargs["risk_n_deltas"] is None
     assert kwargs["x_stddev"] is None
+
+
+def test_modern_optimize_cli_uses_checkpoint_metadata(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "learner.ckpt"
+    X = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    torch_checkpoint = {
+        "state_dict": {},
+        DEEPOPT_CHECKPOINT_KEY: {
+            "schema_version": 1,
+            "model_type": "GP",
+            "training_data": {"X": X, "y": y},
+            "bounds": torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+            "config_settings": {"model_type": "GP"},
+            "multi_fidelity": False,
+        },
+    }
+    torch.save(torch_checkpoint, checkpoint)
+    calls = []
+
+    def fake_optimize(self, **kwargs):
+        calls.append((self, kwargs))
+
+    monkeypatch.setattr(GPModel, "optimize", fake_optimize)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        deepopt_cli,
+        [
+            "optimize",
+            "-o",
+            str(tmp_path / "suggested.npy"),
+            "-l",
+            str(checkpoint),
+            "-a",
+            "EI",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    model, kwargs = calls[0]
+    assert model.config_settings.get_setting("model_type") == "GP"
+    assert kwargs["learner_file"] == str(checkpoint)
+
+
+def test_legacy_optimize_cli_requires_infile_and_bounds(tmp_path):
+    learner_file = tmp_path / "legacy.ckpt"
+    learner_file.write_text("placeholder")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        deepopt_cli,
+        [
+            "optimize",
+            "-o",
+            str(tmp_path / "suggested.npy"),
+            "-l",
+            str(learner_file),
+            "-a",
+            "EI",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Legacy checkpoints require --infile" in result.output
 
 
 def test_risk_cli_parses_x_stddev_when_risk_measure_used(

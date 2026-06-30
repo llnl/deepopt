@@ -14,7 +14,7 @@ from click.core import iter_params_for_processing
 
 from deepopt.configuration import ConfigSettings
 from deepopt.defaults import Defaults
-from deepopt.models import DelUQModel, GPModel, NNEnsembleModel
+from deepopt.models import DelUQModel, GPModel, NNEnsembleModel, get_checkpoint_metadata, load_deepopt_wrapper
 
 
 def get_deepopt_model(model_type: str) -> Union[GPModel, DelUQModel, NNEnsembleModel]:
@@ -250,7 +250,7 @@ def learn(
     "--infile",
     help="Training data path.",
     type=click.Path(exists=True),
-    required=True,
+    required=False,
 )
 @click.option(
     "-o",
@@ -271,7 +271,7 @@ def learn(
     "--bounds",
     help="Bounds for each input dimension.",
     type=click.STRING,
-    required=True,
+    required=False,
 )
 @click.option(
     "-a",
@@ -340,9 +340,6 @@ def learn(
     type=click.STRING,
     default=Defaults.fidelity_cost,
     show_default=True,
-    cls=ConditionalOption,
-    depends_on="multi_fidelity",
-    equal_to=True,
 )
 @click.option(
     "-v",
@@ -401,9 +398,6 @@ def learn(
     type=click.BOOL,
     default=False,
     show_default=True,
-    cls=ConditionalOption,
-    depends_on="multi_fidelity",
-    equal_to=True,
 )
 def optimize(
     infile,
@@ -430,29 +424,37 @@ def optimize(
     """
     Load in the model created by `learn` and use it to propose new simulation points.
     """    
-    bounds = np.array(json.loads(bounds),dtype=np.float32).T
-
-    config_settings = ConfigSettings(model_type, config_file=config_file)
-
-    deepopt_model = get_deepopt_model(model_type)
-
-    model = deepopt_model(
-        config_settings=config_settings,
-        data_file=infile,
-        multi_fidelity=multi_fidelity,
-        random_seed=random_seed,
-        bounds=bounds,
-        device=device,
-        verbose=verbose,
-    )
+    checkpoint_metadata = get_checkpoint_metadata(learner_file)
+    if checkpoint_metadata is None:
+        if infile is None:
+            raise click.UsageError("Legacy checkpoints require --infile.")
+        if bounds is None:
+            raise click.UsageError("Legacy checkpoints require --bounds.")
+        bounds = np.array(json.loads(bounds),dtype=np.float32).T
+        config_settings = ConfigSettings(model_type, config_file=config_file)
+        deepopt_model = get_deepopt_model(model_type)
+        model = deepopt_model(
+            config_settings=config_settings,
+            data_file=infile,
+            multi_fidelity=multi_fidelity,
+            random_seed=random_seed,
+            bounds=bounds,
+            device=device,
+            verbose=verbose,
+        )
+    else:
+        model = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
 
     risk_measure = None if risk_measure == "None" else risk_measure
     if risk_measure:
         # x_stddev = torch.tensor(json.loads(x_stddev),dtype=torch.float,device=device)
         x_stddev = np.array(json.loads(x_stddev),dtype=np.float32)
-    if multi_fidelity:
+    if model.multi_fidelity:
         # fidelity_cost = torch.tensor(json.loads(fidelity_cost),dtype=torch.float,device=device)
         fidelity_cost = np.array(json.loads(fidelity_cost),dtype=np.float32)
+    else:
+        fidelity_cost = None
+        integer_fidelities = False
     model.optimize(
         outfile=outfile,
         learner_file=learner_file,

@@ -48,6 +48,87 @@ from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
 
+DEEPOPT_CHECKPOINT_KEY = "deepopt_checkpoint"
+DEEPOPT_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _torch_load(learner_file: str, map_location: str = "cpu", weights_only: bool = False):
+    try:
+        return torch.load(learner_file, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(learner_file, map_location=map_location)
+
+
+def get_checkpoint_metadata(learner_file: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
+    try:
+        checkpoint = _torch_load(learner_file, map_location=map_location, weights_only=True)
+    except Exception:
+        return None
+    if not isinstance(checkpoint, dict) or DEEPOPT_CHECKPOINT_KEY not in checkpoint:
+        return None
+    metadata = checkpoint[DEEPOPT_CHECKPOINT_KEY]
+    if not isinstance(metadata, dict):
+        raise ValueError("DeepOpt checkpoint metadata is malformed.")
+    schema_version = metadata.get("schema_version")
+    if schema_version != DEEPOPT_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported DeepOpt checkpoint schema version {schema_version}. "
+            f"This DeepOpt version supports schema version {DEEPOPT_CHECKPOINT_SCHEMA_VERSION}."
+        )
+    model_type = metadata.get("model_type")
+    if model_type not in {"GP", "delUQ", "nnEnsemble"}:
+        raise ValueError(f"DeepOpt checkpoint metadata has invalid model_type {model_type}.")
+    required_fields = {"training_data", "bounds", "config_settings"}
+    missing_fields = required_fields.difference(metadata)
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise ValueError(f"DeepOpt checkpoint metadata is missing required field(s): {missing}.")
+    training_data = metadata["training_data"]
+    if not isinstance(training_data, dict) or "X" not in training_data or "y" not in training_data:
+        raise ValueError("DeepOpt checkpoint metadata training_data must contain X and y.")
+    return metadata
+
+
+def is_self_describing_checkpoint(learner_file: str) -> bool:
+    return get_checkpoint_metadata(learner_file) is not None
+
+
+def _config_settings_from_checkpoint(metadata: Dict[str, Any]) -> ConfigSettings:
+    config_settings = ConfigSettings(metadata["model_type"])
+    config_settings.config_settings.update(metadata.get("config_settings", {}))
+    config_settings.config_file = None
+    return config_settings
+
+
+def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool = False) -> "DeepoptBaseModel":
+    metadata = get_checkpoint_metadata(learner_file)
+    if metadata is None:
+        raise ValueError(
+            "Checkpoint does not contain DeepOpt self-describing metadata. Load it using the legacy explicit path: "
+            "construct the appropriate GPModel, DelUQModel, or NNEnsembleModel with data_file, bounds, "
+            "config_settings, and multi_fidelity, then call load_model(...)."
+        )
+    model_classes = {"GP": GPModel, "delUQ": DelUQModel, "nnEnsemble": NNEnsembleModel}
+    config_settings = _config_settings_from_checkpoint(metadata)
+    return model_classes[metadata["model_type"]](
+        config_settings=config_settings,
+        data_file=metadata.get("data_file"),
+        training_data=metadata["training_data"],
+        bounds=metadata["bounds"],
+        multi_fidelity=metadata.get("multi_fidelity", Defaults.multi_fidelity),
+        random_seed=metadata.get("random_seed", Defaults.random_seed),
+        k_folds=metadata.get("k_folds", Defaults.k_folds),
+        target=metadata.get("target", "dy"),
+        device=device,
+        verbose=verbose,
+    )
+
+
+def load_deepopt_model(learner_file: str, device: str = "auto", verbose: bool = False) -> Type[Model]:
+    wrapper = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
+    return wrapper.load_model(learner_file)
+
+
 class FidelityCostModel(DeterministicModel):
     """
     The cost model for multi-fidelity runs.
@@ -110,9 +191,9 @@ class DeepoptBaseModel(ABC):
         saved in a dict format since it's necessary for BoTorch. `Default: None`
     """
 
-    data_file: str
-    bounds: np.ndarray
-    config_settings: ConfigSettings
+    data_file: str = None
+    bounds: np.ndarray = None
+    config_settings: ConfigSettings = None
     random_seed: int = Defaults.random_seed
     multi_fidelity: bool = Defaults.multi_fidelity
     num_fidelities: int = None
@@ -126,22 +207,28 @@ class DeepoptBaseModel(ABC):
     target: str = "dy"
     target_fidelities: Dict[int, float] = None
     verbose: bool = False
+    training_data: Dict[str, Any] = None
 
     def __post_init__(self) -> None:
-        try:
-            input_data = np.load(self.data_file)
-            self.X_orig = torch.from_numpy(input_data["X"]).float()
-            self.Y_orig = torch.from_numpy(input_data["y"]).float()
-        except ValueError:
-            input_data = np.load(self.data_file,allow_pickle=True)
-            self.X_orig = torch.from_numpy(input_data["X"].astype(np.float32))
-            self.Y_orig = torch.from_numpy(input_data["y"].astype(np.float32))
+        if self.training_data is None:
+            try:
+                input_data = np.load(self.data_file)
+                self.X_orig = torch.from_numpy(input_data["X"]).float()
+                self.Y_orig = torch.from_numpy(input_data["y"]).float()
+            except ValueError:
+                input_data = np.load(self.data_file,allow_pickle=True)
+                self.X_orig = torch.from_numpy(input_data["X"].astype(np.float32))
+                self.Y_orig = torch.from_numpy(input_data["y"].astype(np.float32))
+        else:
+            self.X_orig = torch.as_tensor(self.training_data["X"]).float()
+            self.Y_orig = torch.as_tensor(self.training_data["y"]).float()
         if len(self.Y_orig.shape) == 1:
             self.Y_orig = self.Y_orig.reshape(-1, 1)
-        self.full_train_X = (self.X_orig - self.bounds[0]) / (self.bounds[1] - self.bounds[0])  # both models
+        bounds = torch.as_tensor(self.bounds, dtype=torch.float)
+        self.full_train_X = (self.X_orig - bounds[0]) / (bounds[1] - bounds[0])  # both models
         if self.multi_fidelity:
             self.full_train_X[:, -1] = self.X_orig[:, -1].round()
-            self.num_fidelities = int(self.bounds[1, -1]) + 1
+            self.num_fidelities = int(bounds[1, -1]) + 1
         else:
             self.num_fidelities = 1
             
@@ -156,7 +243,7 @@ class DeepoptBaseModel(ABC):
 
         self.full_train_X = self.full_train_X.to(self.device)
         self.full_train_Y = self.Y_orig.clone().to(self.device)
-        self.bounds = torch.tensor(self.bounds,dtype=torch.float,device=self.device)
+        self.bounds = bounds.to(self.device)
 
         self.input_dim = self.full_train_X.size(-1)
         self.output_dim = self.full_train_Y.shape[-1]
@@ -173,6 +260,24 @@ class DeepoptBaseModel(ABC):
         torch.manual_seed(self.random_seed)
         np.random.seed(self.random_seed)
         random.seed(self.random_seed)
+
+    def _checkpoint_metadata(self) -> Dict[str, Any]:
+        return {
+            "schema_version": DEEPOPT_CHECKPOINT_SCHEMA_VERSION,
+            "model_type": self.config_settings.get_setting("model_type"),
+            "training_data": {
+                "X": self.X_orig.detach().cpu(),
+                "y": self.Y_orig.detach().cpu(),
+            },
+            "bounds": self.bounds.detach().cpu(),
+            "config_settings": dict(self.config_settings.config_settings),
+            "random_seed": self.random_seed,
+            "k_folds": self.k_folds,
+            "multi_fidelity": self.multi_fidelity,
+            "num_fidelities": self.num_fidelities,
+            "target": self.target,
+            "data_file": self.data_file,
+        }
 
     @abstractmethod
     def train(self, outfile: str) -> Type[Model]:
@@ -757,7 +862,11 @@ class GPModel(DeepoptBaseModel):
 
         fit_gpytorch_model(mll)
 
-        state = {"state_dict": model.state_dict(), "output_scaler": self.output_scaler.state_dict()}
+        state = {
+            "state_dict": model.state_dict(),
+            "output_scaler": self.output_scaler.state_dict(),
+            DEEPOPT_CHECKPOINT_KEY: self._checkpoint_metadata(),
+        }
         torch.save(state, join(getcwd(), dirname(outfile), basename(outfile)))
         return model
 
@@ -772,7 +881,7 @@ class GPModel(DeepoptBaseModel):
         """
 
         model: Union[SingleTaskGP, SingleTaskMultiFidelityGP] = None
-        state_dict = torch.load(learner_file, map_location=self.device)
+        state_dict = _torch_load(learner_file, map_location=self.device)
         model_state = dict(state_dict["state_dict"])
         if "output_scaler" in state_dict:
             self.output_scaler = OutputScaler.from_state_dict(state_dict["output_scaler"], device=self.device)
@@ -958,7 +1067,7 @@ class DelUQModel(DeepoptBaseModel):
             fname = basename(outfile)[:-5]
         else:
             fname = basename(outfile)
-        model.save_ckpt(join(getcwd(), dirname(outfile)), fname)
+        model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
         ray.shutdown()
         return model
 
@@ -1040,7 +1149,7 @@ class NNEnsembleModel(DeepoptBaseModel):
             fname = basename(outfile)[:-5]
         else:
             fname = basename(outfile)
-        model.save_ckpt(join(getcwd(), dirname(outfile)), fname)
+        model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
         ray.shutdown()
         return model
 

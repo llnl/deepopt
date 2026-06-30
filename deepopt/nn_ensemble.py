@@ -5,7 +5,7 @@ neural networks.
 import os
 import warnings
 from copy import copy,deepcopy
-from typing import Any, Callable, Tuple, Type, Union, List
+from typing import Any, Callable, Dict, Tuple, Type, Union, List
 
 import numpy as np
 import torch
@@ -255,7 +255,7 @@ class NNEnsemble(Model):
                     opt.step()
                     avg_loss += f_loss.item() / len(loader)
 
-    def save_ckpt(self, path: str, name: str):
+    def save_ckpt(self, path: str, name: str, checkpoint_metadata: Dict[str, Any] = None):
         """
         Save a trained model to a checkpoint file
 
@@ -267,6 +267,8 @@ class NNEnsemble(Model):
         state["B"] = [f_pred.B for f_pred in self.f_predictor]
         state["opt_state_dict"] = [opt.state_dict() for opt in self.f_optimizer]
         state["output_scaler"] = self.output_scaler.state_dict()
+        if checkpoint_metadata is not None:
+            state["deepopt_checkpoint"] = checkpoint_metadata
         filename = path + "/" + name + ".ckpt"
         torch.save(state, filename)
         print("Saved Ckpts")
