@@ -14,6 +14,7 @@ from deepopt.models import (
     FidelityCostModel,
     GPModel,
     load_deepopt_model,
+    load_deepopt_wrapper,
 )
 
 pytestmark = pytest.mark.requires_botorch
@@ -218,6 +219,151 @@ def test_get_risk_measure_objective_supported_and_unknown(single_fidelity_data_f
     assert model.get_risk_measure_objective("unknown") is None
     assert model.get_risk_measure_objective("VaR", alpha=0.5, n_w=4).__class__.__name__ == "VaR"
     assert model.get_risk_measure_objective("CVaR", alpha=0.5, n_w=4).__class__.__name__ == "CVaR"
+
+
+@pytest.mark.requires_botorch
+def test_loaded_wrapper_get_var_uses_checkpoint_path(monkeypatch, tmp_path, single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+
+    monkeypatch.setattr("deepopt.models.fit_gpytorch_model", lambda _mll: None)
+    checkpoint = tmp_path / "gp.pt"
+    wrapper.train(str(checkpoint))
+
+    loaded_wrapper = load_deepopt_wrapper(str(checkpoint), device="cpu")
+    values = loaded_wrapper.get_var(risk_level=0.5, x_stddev=torch.tensor([0.0, 0.0]), risk_n_deltas=4)
+
+    assert values.shape == torch.Size([len(loaded_wrapper.full_train_X)])
+
+
+@pytest.mark.requires_botorch
+def test_get_cvar_accepts_explicit_learner_file(monkeypatch, tmp_path, single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+
+    monkeypatch.setattr("deepopt.models.fit_gpytorch_model", lambda _mll: None)
+    checkpoint = tmp_path / "gp.pt"
+    wrapper.train(str(checkpoint))
+
+    values = wrapper.get_cvar(
+        wrapper.full_train_X[:2],
+        risk_level=0.5,
+        x_stddev=torch.tensor([0.0, 0.0]),
+        risk_n_deltas=4,
+        learner_file=str(checkpoint),
+    )
+    single_value = wrapper.get_cvar(
+        wrapper.full_train_X[:1],
+        risk_level=0.5,
+        x_stddev=torch.tensor([0.0, 0.0]),
+        risk_n_deltas=4,
+        learner_file=str(checkpoint),
+    )
+    one_dimensional_query_value = wrapper.get_cvar(
+        wrapper.full_train_X[0],
+        risk_level=0.5,
+        x_stddev=torch.tensor([0.0, 0.0]),
+        risk_n_deltas=4,
+        learner_file=str(checkpoint),
+    )
+
+    assert values.shape == torch.Size([2])
+    assert single_value.shape == torch.Size([1])
+    assert one_dimensional_query_value.shape == torch.Size([1])
+
+
+@pytest.mark.requires_botorch
+def test_get_var_requires_checkpoint_path(single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="No learner_file was provided"):
+        wrapper.get_var(risk_level=0.5, x_stddev=torch.tensor([0.0, 0.0]), risk_n_deltas=4)
+
+
+@pytest.mark.requires_botorch
+def test_risk_accessor_zeroes_fidelity_stddev(monkeypatch, tmp_path, multi_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0, 0.0], [2.0, 4.0, 2.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(multi_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        multi_fidelity=True,
+        device="cpu",
+    )
+    captured = {}
+
+    monkeypatch.setattr("deepopt.models.fit_gpytorch_model", lambda _mll: None)
+    checkpoint = tmp_path / "gp.pt"
+    wrapper.train(str(checkpoint))
+
+    original_get_input_perturbation = wrapper.get_input_perturbation
+
+    def fake_get_input_perturbation(risk_n_deltas, bounds, X_stddev):
+        captured["bounds"] = bounds.detach().clone()
+        captured["X_stddev"] = X_stddev.detach().clone()
+        return original_get_input_perturbation(risk_n_deltas, bounds, X_stddev)
+
+    monkeypatch.setattr(wrapper, "get_input_perturbation", fake_get_input_perturbation)
+    monkeypatch.setattr(wrapper, "_evaluate_risk_measure", lambda model, risk_objective, X_query: torch.zeros(X_query.shape[-2]))
+
+    wrapper.get_var(risk_level=0.5, x_stddev=torch.tensor([0.2, 0.4, 3.0]), risk_n_deltas=4, learner_file=str(checkpoint))
+
+    torch.testing.assert_close(captured["X_stddev"], torch.tensor([0.1, 0.1, 0.0]))
+    torch.testing.assert_close(captured["bounds"][:, -1], torch.tensor([0.0, 2.0]))
+
+
+@pytest.mark.requires_botorch
+def test_risk_accessors_select_botorch_objectives(monkeypatch, single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+        learner_file="checkpoint.pt",
+    )
+    calls = []
+
+    def fake_load_model(learner_file):
+        return type("FakeModel", (), {"input_transform": None, "eval": lambda self: None})()
+
+    def fake_get_risk_measure_objective(risk_measure, **kwargs):
+        calls.append((risk_measure, kwargs))
+        return object()
+
+    monkeypatch.setattr(wrapper, "load_model", fake_load_model)
+    monkeypatch.setattr(wrapper, "get_input_perturbation", lambda risk_n_deltas, bounds, X_stddev: object())
+    monkeypatch.setattr(wrapper, "get_risk_measure_objective", fake_get_risk_measure_objective)
+    monkeypatch.setattr(wrapper, "_evaluate_risk_measure", lambda model, risk_objective, X_query: torch.zeros(X_query.shape[-2]))
+
+    wrapper.get_var(risk_level=0.25, x_stddev=torch.tensor([0.0, 0.0]), risk_n_deltas=8)
+    wrapper.get_cvar(risk_level=0.75, x_stddev=torch.tensor([0.0, 0.0]), risk_n_deltas=16)
+
+    assert calls == [
+        ("VaR", {"alpha": 0.25, "n_w": 8}),
+        ("CVaR", {"alpha": 0.75, "n_w": 16}),
+    ]
 
 
 def test_deepopt_base_model_remains_abstract():

@@ -121,6 +121,7 @@ def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool 
         target=metadata.get("target", "dy"),
         device=device,
         verbose=verbose,
+        learner_file=learner_file,
     )
 
 
@@ -208,6 +209,7 @@ class DeepoptBaseModel(ABC):
     target_fidelities: Dict[int, float] = None
     verbose: bool = False
     training_data: Dict[str, Any] = None
+    learner_file: str = None
 
     def __post_init__(self) -> None:
         if self.training_data is None:
@@ -377,6 +379,121 @@ class DeepoptBaseModel(ABC):
             bounds=bounds,
         ).eval()
         return input_pertubation
+
+    def _resolve_learner_file(self, learner_file: Optional[str]) -> str:
+        learner_file = learner_file or self.learner_file
+        if learner_file is None:
+            raise ValueError(
+                "No learner_file was provided and this wrapper does not have a checkpoint path. "
+                "Pass learner_file=... or construct the wrapper with load_deepopt_wrapper(...)."
+            )
+        return learner_file
+
+    def _prepare_risk_query_inputs(
+        self,
+        X_query: Optional[torch.Tensor],
+        x_stddev: Union[np.ndarray, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if X_query is None:
+            X_query = self.full_train_X
+        X_query = torch.as_tensor(X_query, dtype=torch.float, device=self.device)
+        if X_query.ndim == 1:
+            X_query = X_query.reshape(1, -1)
+        x_stddev = torch.as_tensor(x_stddev, dtype=torch.float, device=self.device)
+        if X_query.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected X_query last dimension {self.input_dim}, received {X_query.shape[-1]}.")
+        if x_stddev.numel() != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} values for x_stddev, received {x_stddev.numel()}.")
+        return X_query, x_stddev.reshape(-1)
+
+    def _get_scaled_x_stddev(self, x_stddev: torch.Tensor) -> torch.Tensor:
+        x_stddev_scaled = x_stddev / (self.bounds[1] - self.bounds[0])
+        x_stddev_scaled = x_stddev_scaled.clone()
+        if self.multi_fidelity:
+            x_stddev_scaled[-1] = 0
+        return x_stddev_scaled
+
+    def _prepare_risk_evaluation(
+        self,
+        risk_measure: str,
+        risk_level: float,
+        risk_n_deltas: int,
+        x_stddev: torch.Tensor,
+        learner_file: Optional[str],
+    ) -> Tuple[Type[Model], Type[RiskMeasureMCObjective]]:
+        if risk_n_deltas <= 0:
+            raise ValueError("risk_n_deltas must be positive.")
+        model = self.load_model(learner_file=self._resolve_learner_file(learner_file))
+        x_stddev_scaled = self._get_scaled_x_stddev(x_stddev)
+        bounds_scaled = torch.tensor(self.input_dim * [[0, 1]], dtype=torch.float, device=self.device).T
+        if self.multi_fidelity:
+            bounds_scaled[1, -1] = self.num_fidelities - 1
+        risk_objective = self.get_risk_measure_objective(
+            risk_measure=risk_measure,
+            alpha=risk_level,
+            n_w=risk_n_deltas,
+        )
+        if risk_objective is None:
+            raise ValueError(f"Unsupported risk measure {risk_measure}.")
+        model.input_transform = self.get_input_perturbation(
+            risk_n_deltas=risk_n_deltas,
+            bounds=bounds_scaled,
+            X_stddev=x_stddev_scaled,
+        )
+        model.eval()
+        return model, risk_objective
+
+    def _evaluate_risk_measure(
+        self,
+        model: Type[Model],
+        risk_objective: Type[RiskMeasureMCObjective],
+        X_query: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            posterior = model.posterior(X_query.unsqueeze(-2))
+            samples = posterior.rsample().squeeze(0)
+            return risk_objective(samples).squeeze(-1)
+
+    def _get_risk_measure_values(
+        self,
+        risk_measure: str,
+        X_query: Optional[torch.Tensor],
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int,
+        learner_file: Optional[str],
+    ) -> torch.Tensor:
+        X_query, x_stddev = self._prepare_risk_query_inputs(X_query, x_stddev)
+        model, risk_objective = self._prepare_risk_evaluation(
+            risk_measure=risk_measure,
+            risk_level=risk_level,
+            risk_n_deltas=risk_n_deltas,
+            x_stddev=x_stddev,
+            learner_file=learner_file,
+        )
+        return self._evaluate_risk_measure(model, risk_objective, X_query)
+
+    def get_var(
+        self,
+        X_query: Optional[torch.Tensor] = None,
+        *,
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int = 128,
+        learner_file: Optional[str] = None,
+    ) -> torch.Tensor:
+        return self._get_risk_measure_values("VaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
+
+    def get_cvar(
+        self,
+        X_query: Optional[torch.Tensor] = None,
+        *,
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int = 128,
+        learner_file: Optional[str] = None,
+    ) -> torch.Tensor:
+        return self._get_risk_measure_values("CVaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
 
     def _get_candidates_mf(
         self,
@@ -755,6 +872,7 @@ class DeepoptBaseModel(ABC):
             x_stddev_scaled = x_stddev / (self.bounds[1] - self.bounds[0])
             bounds_scaled = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float).T
             if self.multi_fidelity:
+                bounds_scaled[1, -1] = self.num_fidelities - 1
                 x_stddev_scaled[-1] = 0
             risk_objective = self.get_risk_measure_objective(risk_measure=risk_measure, alpha=risk_level, n_w=risk_n_deltas)
             model.input_transform = self.get_input_perturbation(
@@ -867,7 +985,8 @@ class GPModel(DeepoptBaseModel):
             "output_scaler": self.output_scaler.state_dict(),
             DEEPOPT_CHECKPOINT_KEY: self._checkpoint_metadata(),
         }
-        torch.save(state, join(getcwd(), dirname(outfile), basename(outfile)))
+        self.learner_file = join(getcwd(), dirname(outfile), basename(outfile))
+        torch.save(state, self.learner_file)
         return model
 
     def load_model(self, learner_file: str) -> Union[SingleTaskGP, SingleTaskMultiFidelityGP]:
@@ -1068,6 +1187,7 @@ class DelUQModel(DeepoptBaseModel):
         else:
             fname = basename(outfile)
         model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
+        self.learner_file = join(getcwd(), dirname(outfile), f"{fname}.ckpt")
         ray.shutdown()
         return model
 
@@ -1150,6 +1270,7 @@ class NNEnsembleModel(DeepoptBaseModel):
         else:
             fname = basename(outfile)
         model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
+        self.learner_file = join(getcwd(), dirname(outfile), f"{fname}.ckpt")
         ray.shutdown()
         return model
 
