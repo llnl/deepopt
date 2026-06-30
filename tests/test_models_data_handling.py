@@ -84,7 +84,7 @@ def test_gp_uses_scaled_training_outputs_and_public_prediction_units(monkeypatch
 
 
 @pytest.mark.requires_botorch
-def test_gp_load_rejects_legacy_standardize_checkpoint(tmp_path, single_fidelity_data_file):
+def test_gp_loads_legacy_standardize_checkpoint(monkeypatch, tmp_path, single_fidelity_data_file):
     settings = ConfigSettings("GP")
     bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
     wrapper = GPModel(
@@ -94,10 +94,29 @@ def test_gp_load_rejects_legacy_standardize_checkpoint(tmp_path, single_fidelity
         device="cpu",
     )
     checkpoint = tmp_path / "legacy_gp.pt"
-    torch.save({"state_dict": {"outcome_transform.means": torch.zeros(1, 1)}}, checkpoint)
+    torch.save(
+        {
+            "state_dict": {
+                "outcome_transform.means": torch.tensor([[0.5]]),
+                "outcome_transform.stdvs": torch.tensor([[0.25]]),
+            }
+        },
+        checkpoint,
+    )
+    captured_state = {}
 
-    with pytest.raises(RuntimeError, match="previous Standardize outcome transform"):
+    def fake_load_state_dict(self, state_dict):
+        captured_state.update(state_dict)
+        return None
+
+    monkeypatch.setattr(DeepOptSingleTaskGP, "load_state_dict", fake_load_state_dict)
+
+    with pytest.warns(RuntimeWarning, match="legacy GP checkpoint"):
         wrapper.load_model(str(checkpoint))
+
+    assert not any(key.startswith("outcome_transform.") for key in captured_state)
+    torch.testing.assert_close(wrapper.full_train_Y_scaled, (wrapper.full_train_Y - 0.5) / 0.25)
+    torch.testing.assert_close(wrapper.output_scaler.inverse_transform(wrapper.full_train_Y_scaled), wrapper.full_train_Y)
 
 
 def test_fidelity_cost_model_uses_rounded_last_column():

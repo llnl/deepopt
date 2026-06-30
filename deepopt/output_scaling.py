@@ -6,6 +6,69 @@ from typing import Any, Dict, Optional
 import torch
 
 
+class StandardizeOutputScaler:
+    """
+    Legacy z-score output scaler for old BoTorch Standardize checkpoints.
+    """
+
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-12) -> None:
+        self.mean = mean.float().detach()
+        std = std.float().detach()
+        self.std = torch.where(std.abs() >= eps, std, torch.ones_like(std))
+        self.eps = eps
+
+    def to(self, device: torch.device) -> "StandardizeOutputScaler":
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
+        return self
+
+    def transform(self, Y: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        mean, std = self._standardization_tensors(Y)
+        return (Y - mean) / std
+
+    def inverse_transform(self, Y: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        mean, std = self._standardization_tensors(Y)
+        return Y * std + mean
+
+    def inverse_variance(self, Yvar: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        _, std = self._standardization_tensors(Yvar)
+        return Yvar * std.pow(2)
+
+    def inverse_covariance(self, covariance: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        std = self.std.to(covariance.device).squeeze()
+        if std.numel() == 1:
+            return covariance * std.pow(2)
+        return covariance * std.unsqueeze(-1) * std.unsqueeze(-2)
+
+    @classmethod
+    def from_botorch_state_dict(
+        cls,
+        state: Dict[str, torch.Tensor],
+        device: Optional[torch.device] = None,
+        prefix: str = "outcome_transform.",
+    ) -> "StandardizeOutputScaler":
+        mean_key = f"{prefix}means"
+        std_key = f"{prefix}stdvs"
+        std_sq_key = f"{prefix}_stdvs_sq"
+        if mean_key not in state:
+            raise RuntimeError("Legacy Standardize checkpoint is missing outcome_transform.means.")
+        if std_key in state:
+            std = state[std_key]
+        elif std_sq_key in state:
+            std = state[std_sq_key].sqrt()
+        else:
+            raise RuntimeError(
+                "Legacy Standardize checkpoint is missing standard deviation statistics and cannot be loaded."
+            )
+        scaler = cls(state[mean_key], std)
+        if device is not None:
+            scaler.to(device)
+        return scaler
+
+    def _standardization_tensors(self, Y: torch.Tensor) -> tuple:
+        return self.mean.to(Y.device), self.std.to(Y.device)
+
+
 class OutputScaler:
     """
     Min/max output scaler with optional per-fidelity scaling.

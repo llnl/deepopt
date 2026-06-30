@@ -43,7 +43,7 @@ from deepopt.configuration import ConfigSettings
 from deepopt.defaults import Defaults
 from deepopt.deltaenc import DeltaEnc
 from deepopt.nn_ensemble import NNEnsemble
-from deepopt.output_scaling import OutputScaler
+from deepopt.output_scaling import OutputScaler, StandardizeOutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
@@ -773,13 +773,18 @@ class GPModel(DeepoptBaseModel):
 
         model: Union[SingleTaskGP, SingleTaskMultiFidelityGP] = None
         state_dict = torch.load(learner_file, map_location=self.device)
+        model_state = dict(state_dict["state_dict"])
         if "output_scaler" in state_dict:
             self.output_scaler = OutputScaler.from_state_dict(state_dict["output_scaler"], device=self.device)
             self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
-        elif any(key.startswith("outcome_transform.") for key in state_dict["state_dict"]):
-            raise RuntimeError(
-                "This GP checkpoint was trained with the previous Standardize outcome transform and cannot "
-                "be loaded into the new DeepOpt min/max output-scaling path. Retrain the GP checkpoint."
+        elif any(key.startswith("outcome_transform.") for key in model_state):
+            self.output_scaler = StandardizeOutputScaler.from_botorch_state_dict(model_state, device=self.device)
+            self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
+            model_state = {key: value for key, value in model_state.items() if not key.startswith("outcome_transform.")}
+            warnings.warn(
+                "Loaded legacy GP checkpoint with BoTorch Standardize output scaling; using compatibility "
+                "z-score scaling for predictions.",
+                RuntimeWarning,
             )
         else:
             warnings.warn(
@@ -799,7 +804,7 @@ class GPModel(DeepoptBaseModel):
                 self.full_train_Y_scaled,
             )
         model.output_scaler = self.output_scaler
-        model.load_state_dict(state_dict["state_dict"])
+        model.load_state_dict(model_state)
         return model
 
 
