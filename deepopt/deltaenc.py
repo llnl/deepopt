@@ -19,6 +19,7 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 from deepopt.configuration import ConfigSettings
+from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
@@ -43,6 +44,7 @@ class DeltaEnc(Model):
         target: str = "dy",  # 'y', 'dy'
         multi_fidelity: bool = False,
         output_scaler: OutputScaler = None,
+        input_scaler: InputScaler = None,
     ):
         """
         Initialize an instance of the `DeltaEnc` model for further processing.
@@ -93,6 +95,7 @@ class DeltaEnc(Model):
                 fidelity_dim=self.input_dim - 1,
             ).fit(y_train, X_train)
         self.output_scaler = output_scaler.to(self.device)
+        self.input_scaler = input_scaler.to(self.device) if input_scaler is not None else None
         self.y_min = self.output_scaler.y_min
         self.y_max = self.output_scaler.y_max
         self.out_scaler = lambda y, y_min, y_max: (y - y_min) / torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min))
@@ -246,6 +249,8 @@ class DeltaEnc(Model):
         state["B"] = self.f_predictor.B
         state["opt_state_dict"] = self.f_optimizer.state_dict()
         state["output_scaler"] = self.output_scaler.state_dict()
+        if self.input_scaler is not None:
+            state["input_scaler"] = self.input_scaler.state_dict()
         if checkpoint_metadata is not None:
             state["deepopt_checkpoint"] = checkpoint_metadata
         filename = path + "/" + name + ".ckpt"
@@ -260,6 +265,8 @@ class DeltaEnc(Model):
         :param name: The name of the checkpoint file
         """
         saved_state = torch.load(os.path.join(path, name + ".ckpt"), map_location=self.device)
+        if "input_scaler" in saved_state:
+            self.input_scaler = InputScaler.from_state_dict(saved_state["input_scaler"], device=self.device)
         if "output_scaler" in saved_state:
             self.output_scaler = OutputScaler.from_state_dict(saved_state["output_scaler"], device=self.device)
             self.y_min = self.output_scaler.y_min
@@ -269,8 +276,26 @@ class DeltaEnc(Model):
                 "DeltaEnc checkpoint has no output_scaler state; using scaler fit from the current data file.",
                 RuntimeWarning,
             )
+        metadata = saved_state.get("deepopt_checkpoint")
+        if self.input_scaler is not None and isinstance(metadata, dict) and "training_data" in metadata:
+            training_data = metadata["training_data"]
+            self.X_train = self.input_scaler.transform(training_data["X"]).to(self.device)
+            self.y_train = torch.as_tensor(training_data["y"]).float().to(self.device)
+            if len(self.y_train.shape) == 1:
+                self.y_train = self.y_train.reshape(-1, 1)
+            self.input_dim = self.X_train.shape[-1]
+            self.output_dim = self.y_train.shape[-1]
+            self._batch_shape = self.X_train.shape[:-2]
+            self.n_train = self.X_train.shape[-2]
+            self.train_inputs = (self.X_train,)
+        if self.multi_fidelity:
+            self.train_fid_locs = [self.X_train[..., -1] == i for i in self.X_train[..., -1].unique()]
+        self.X_train_scaled = self.X_train.clone()
         self.y_train_scaled = self.output_scaler.transform(self.y_train.clone(), self.X_train)
+        self.X_train_nn = self.X_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
         self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
+        self.nn_input_dim = self.X_train_nn.shape[1]
+        self.nn_output_dim = self.y_train_nn.shape[1]
         self.f_predictor.load_state_dict(saved_state["state_dict"])
         self.f_predictor.B = saved_state["B"]
 
@@ -329,36 +354,47 @@ class DeltaEnc(Model):
         """
         use_variances = kwargs.get("use_variances")
         if any([use_variances is None, use_variances is False]):
-            means, covs = self.get_prediction_with_uncertainty(X, get_cov=True, original_scale=False, **kwargs)
+            means, covs = self.get_prediction_with_uncertainty(
+                X,
+                get_cov=True,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             try:
-                return MultivariateNormal(means, covs + 1e-6 * torch.eye(covs.shape[-1]))
+                return MultivariateNormal(means, covs + 1e-6 * torch.eye(covs.shape[-1], device=covs.device))
             except Exception as exc1:
                 print(exc1)
                 print("Trying with stronger regularization (1e-5)")
                 try:
-                    return MultivariateNormal(means, covs + 1e-5 * torch.eye(covs.shape[-1]))
+                    return MultivariateNormal(means, covs + 1e-5 * torch.eye(covs.shape[-1], device=covs.device))
                 except Exception as exc2:
                     print(exc2)
                     print("Trying with even stronger regularization (1e-4)")
                     try:
-                        return MultivariateNormal(means, covs + 1e-4 * torch.eye(covs.shape[-1]))
+                        return MultivariateNormal(means, covs + 1e-4 * torch.eye(covs.shape[-1], device=covs.device))
                     except Exception as exc3:
                         print(exc3)
                         print("Trying with yet stronger regularization (1e-3)")
-                        return MultivariateNormal(means, covs + 1e-3 * torch.eye(covs.shape[-1]))
+                        return MultivariateNormal(means, covs + 1e-3 * torch.eye(covs.shape[-1], device=covs.device))
 
         else:
-            means, variances = self.get_prediction_with_uncertainty(X, **kwargs)
+            means, variances = self.get_prediction_with_uncertainty(
+                X,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             if means.ndim in (1, 2):
                 means_squeeze, variances_squeeze = means.squeeze(), variances.squeeze()
                 if means_squeeze.ndim == 0:
-                    means_squeeze = torch.Tensor([means_squeeze])
+                    means_squeeze = torch.tensor([means_squeeze], dtype=torch.float, device=means.device)
                 if variances_squeeze.ndim == 0:
-                    variances_squeeze = torch.Tensor([variances_squeeze])
+                    variances_squeeze = torch.tensor([variances_squeeze], dtype=torch.float, device=variances.device)
                 mvn = MultivariateNormal(means_squeeze, torch.diag(variances_squeeze + 1e-6))
             else:
                 covar_diag = variances.squeeze(-1) + 1e-6
-                covars = torch.zeros(*covar_diag.shape, covar_diag.shape[-1])
+                covars = torch.zeros(*covar_diag.shape, covar_diag.shape[-1], device=variances.device)
                 for i in range(covar_diag.shape[-1]):
                     covars[..., i, i] = covar_diag[..., i]
                 mvn = MultivariateNormal(means.squeeze(-1), covars)
@@ -369,7 +405,9 @@ class DeltaEnc(Model):
         self,
         q: torch.Tensor,
         get_cov: bool = False,
-        original_scale: bool = True,
+        *args: Any,
+        original_scale_x: bool = True,
+        original_scale_y: bool = True,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -377,12 +415,17 @@ class DeltaEnc(Model):
 
         :param q: A tensor with data we'll calculate prediction with uncertainty for
         :param get_cov: If True, get the covariance. Otherwise, get the variance.
-        :param original_scale: If True, apply an inverse scaling transformation to get the scaled
-            predictions back to the original scale. Otherwise, don't re-scale the predictions.
+        :param original_scale_x: If True, transform query inputs from original units to model units.
+        :param original_scale_y: If True, transform predictions back to original output units.
 
         :returns: A tuple containing the mean tensor and the variance (or covariance if
             `get_cov=True`) tensor
         """
+        reject_deprecated_original_scale(args, kwargs)
+        if original_scale_x:
+            if self.input_scaler is None:
+                raise RuntimeError("original_scale_x=True requires this model to have an input_scaler.")
+            q = self.input_scaler.transform(q)
         orig_input_shape = q.shape
         assert (
             q.shape[-1] == self.input_dim
@@ -436,7 +479,7 @@ class DeltaEnc(Model):
         val = val.reshape(n_ref, *samples_shape, *self.batch_shape, self.output_dim).moveaxis(1, -2)
         assert val.shape[1:-1] == input_shape[:-1], "Something went wrong with reshaping."
 
-        if original_scale:
+        if original_scale_y:
             all_preds = self.output_scaler.inverse_transform(val, q)
         else:
             all_preds = val
@@ -531,6 +574,7 @@ class DeltaEnc(Model):
                 target=self.target,
                 multi_fidelity=self.multi_fidelity,
                 output_scaler=self.output_scaler,
+                input_scaler=self.input_scaler,
             )
             if hasattr(self, "input_transform"):
                 fantasy_model.input_transform = self.input_transform

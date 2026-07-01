@@ -8,6 +8,7 @@ pytest.importorskip("gpytorch")
 from deepopt.configuration import ConfigSettings
 from deepopt.deltaenc import DeltaEnc
 from deepopt.nn_ensemble import NNEnsemble
+from deepopt.input_scaling import InputScaler
 from deepopt.models import DEEPOPT_CHECKPOINT_KEY, NNEnsembleModel, load_deepopt_wrapper
 from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP, create_optimizer
@@ -118,6 +119,7 @@ def test_nnensemble_checkpoint_round_trip(tmp_path, minimal_nn_config):
     assert len(ckpt["opt_state_dict"]) == 2
     assert len(ckpt["B"]) == 2
     assert "output_scaler" in ckpt
+    assert "input_scaler" not in ckpt
     metadata = ckpt[DEEPOPT_CHECKPOINT_KEY]
     assert metadata["schema_version"] == 1
     assert metadata["model_type"] == "nnEnsemble"
@@ -149,6 +151,7 @@ def test_deltaenc_checkpoint_metadata_round_trip(tmp_path, minimal_nn_config):
     assert "opt_state_dict" in ckpt
     assert "B" in ckpt
     assert "output_scaler" in ckpt
+    assert "input_scaler" not in ckpt
     metadata = ckpt[DEEPOPT_CHECKPOINT_KEY]
     assert metadata["schema_version"] == 1
     assert metadata["model_type"] == "delUQ"
@@ -188,3 +191,91 @@ def test_load_deepopt_wrapper_reconstructs_nnensemble(tmp_path, minimal_nn_confi
     torch.testing.assert_close(wrapper.full_train_X, X)
     torch.testing.assert_close(wrapper.full_train_Y, y)
     assert wrapper.multi_fidelity is False
+
+
+def test_nnensemble_uses_input_scaler_for_original_query_inputs(tmp_path, minimal_nn_config, monkeypatch):
+    settings = _settings(tmp_path, "nnEnsemble", minimal_nn_config)
+    networks = [MLP(settings, unc_type="ensemble", input_dim=2, output_dim=1, device="cpu") for _ in range(2)]
+    optimizers = [create_optimizer(network, settings) for network in networks]
+    X = torch.tensor([[0.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    input_scaler = InputScaler(torch.tensor([[10.0, 20.0], [20.0, 40.0]]))
+    model = NNEnsemble(networks, settings, optimizers, X, y, input_scaler=input_scaler)
+    captured = []
+
+    def capture_forward(inp):
+        captured.append(inp.detach().clone())
+        return torch.zeros(inp.shape[0], 1)
+
+    for network in networks:
+        monkeypatch.setattr(network, "forward", capture_forward)
+
+    model.get_prediction_with_uncertainty(
+        torch.tensor([[15.0, 30.0]], dtype=torch.float32),
+        original_scale_y=False,
+    )
+
+    torch.testing.assert_close(captured[0], torch.tensor([[0.5, 0.5]]))
+    with pytest.raises(TypeError, match="original_scale was renamed"):
+        model.get_prediction_with_uncertainty(X[:1], original_scale=False)
+
+
+def test_nnensemble_checkpoint_round_trip_preserves_input_scaler(tmp_path, minimal_nn_config):
+    settings = _settings(tmp_path, "nnEnsemble", minimal_nn_config)
+    networks = [MLP(settings, unc_type="ensemble", input_dim=2, output_dim=1, device="cpu") for _ in range(2)]
+    optimizers = [create_optimizer(network, settings) for network in networks]
+    X = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    input_scaler = InputScaler(torch.tensor([[10.0, 20.0], [20.0, 40.0]]))
+    model = NNEnsemble(networks, settings, optimizers, X, y, input_scaler=input_scaler)
+    model.save_ckpt(str(tmp_path), "ensemble")
+
+    loaded = torch.load(tmp_path / "ensemble.ckpt")
+    assert "input_scaler" in loaded
+    model.input_scaler = None
+    model.load_ckpt(str(tmp_path), "ensemble")
+
+    torch.testing.assert_close(model.input_scaler.transform(torch.tensor([[15.0, 30.0]])), torch.tensor([[0.5, 0.5]]))
+
+
+def test_deltaenc_uses_input_scaler_for_original_query_inputs(tmp_path, minimal_nn_config, monkeypatch):
+    settings = _settings(tmp_path, "delUQ", minimal_nn_config)
+    network = MLP(settings, unc_type="deltaenc", input_dim=2, output_dim=1, device="cpu")
+    optimizer = create_optimizer(network, settings)
+    X = torch.tensor([[0.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    input_scaler = InputScaler(torch.tensor([[10.0, 20.0], [20.0, 40.0]]))
+    model = DeltaEnc(network, settings, optimizer, X, y, target="y", input_scaler=input_scaler)
+    captured = {}
+
+    def capture_map(_ref, query):
+        captured["query"] = query.detach().clone()
+        return torch.zeros(query.shape[0], 1)
+
+    monkeypatch.setattr(model, "_map_delta_model", capture_map)
+    model.get_prediction_with_uncertainty(
+        torch.tensor([[15.0, 30.0]], dtype=torch.float32),
+        original_scale_y=False,
+    )
+
+    torch.testing.assert_close(captured["query"], torch.tensor([[0.5, 0.5]]).expand_as(captured["query"]))
+    with pytest.raises(TypeError, match="original_scale was renamed"):
+        model.get_prediction_with_uncertainty(X[:1], original_scale=False)
+
+
+def test_deltaenc_checkpoint_round_trip_preserves_input_scaler(tmp_path, minimal_nn_config):
+    settings = _settings(tmp_path, "delUQ", minimal_nn_config)
+    network = MLP(settings, unc_type="deltaenc", input_dim=2, output_dim=1, device="cpu")
+    optimizer = create_optimizer(network, settings)
+    X = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    input_scaler = InputScaler(torch.tensor([[10.0, 20.0], [20.0, 40.0]]))
+    model = DeltaEnc(network, settings, optimizer, X, y, input_scaler=input_scaler)
+    model.save_ckpt(str(tmp_path), "delta")
+
+    loaded = torch.load(tmp_path / "delta.ckpt")
+    assert "input_scaler" in loaded
+    model.input_scaler = None
+    model.load_ckpt(str(tmp_path), "delta")
+
+    torch.testing.assert_close(model.input_scaler.transform(torch.tensor([[15.0, 30.0]])), torch.tensor([[0.5, 0.5]]))

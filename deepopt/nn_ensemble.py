@@ -19,6 +19,7 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 from deepopt.configuration import ConfigSettings
+from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
@@ -44,6 +45,7 @@ class NNEnsemble(Model):
         fantasy_dict: dict = None,
         verbose: bool = False,
         output_scaler: OutputScaler = None,
+        input_scaler: InputScaler = None,
     ):
         """
         Initialize an instance of the `NNEnsemble` model for further processing.
@@ -95,6 +97,7 @@ class NNEnsemble(Model):
                 fidelity_dim=self.input_dim - 1,
             ).fit(y_train, X_train)
         self.output_scaler = output_scaler.to(self.device)
+        self.input_scaler = input_scaler.to(self.device) if input_scaler is not None else None
         self.y_min = self.output_scaler.y_min
         self.y_max = self.output_scaler.y_max
         self.out_scaler = lambda y, y_min, y_max: (y - y_min) / torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min))
@@ -267,6 +270,8 @@ class NNEnsemble(Model):
         state["B"] = [f_pred.B for f_pred in self.f_predictor]
         state["opt_state_dict"] = [opt.state_dict() for opt in self.f_optimizer]
         state["output_scaler"] = self.output_scaler.state_dict()
+        if self.input_scaler is not None:
+            state["input_scaler"] = self.input_scaler.state_dict()
         if checkpoint_metadata is not None:
             state["deepopt_checkpoint"] = checkpoint_metadata
         filename = path + "/" + name + ".ckpt"
@@ -281,6 +286,8 @@ class NNEnsemble(Model):
         :param name: The name of the checkpoint file
         """
         saved_state = torch.load(os.path.join(path, name + ".ckpt"), map_location=self.device)
+        if "input_scaler" in saved_state:
+            self.input_scaler = InputScaler.from_state_dict(saved_state["input_scaler"], device=self.device)
         if "output_scaler" in saved_state:
             self.output_scaler = OutputScaler.from_state_dict(saved_state["output_scaler"], device=self.device)
             self.y_min = self.output_scaler.y_min
@@ -290,8 +297,26 @@ class NNEnsemble(Model):
                 "NNEnsemble checkpoint has no output_scaler state; using scaler fit from the current data file.",
                 RuntimeWarning,
             )
+        metadata = saved_state.get("deepopt_checkpoint")
+        if self.input_scaler is not None and isinstance(metadata, dict) and "training_data" in metadata:
+            training_data = metadata["training_data"]
+            self.X_train = self.input_scaler.transform(training_data["X"]).to(self.device)
+            self.y_train = torch.as_tensor(training_data["y"]).float().to(self.device)
+            if len(self.y_train.shape) == 1:
+                self.y_train = self.y_train.reshape(-1, 1)
+            self.input_dim = self.X_train.shape[-1]
+            self.output_dim = self.y_train.shape[-1]
+            self._batch_shape = self.X_train.shape[:-2]
+            self.n_train = self.X_train.shape[-2]
+            self.train_inputs = (self.X_train,)
+        if self.multi_fidelity:
+            self.train_fid_locs = [self.X_train[..., -1] == i for i in self.X_train[..., -1].unique()]
+        self.X_train_scaled = self.X_train.clone()
         self.y_train_scaled = self.output_scaler.transform(self.y_train.clone(), self.X_train)
+        self.X_train_nn = self.X_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
         self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
+        self.nn_input_dim = self.X_train_nn.shape[1]
+        self.nn_output_dim = self.y_train_nn.shape[1]
         for f_pred,state_dict,B in zip(self.f_predictor,saved_state["state_dict"],saved_state["B"]):
             f_pred.load_state_dict(state_dict)
             f_pred.B = B
@@ -335,7 +360,13 @@ class NNEnsemble(Model):
         """
         use_variances = kwargs.get("use_variances")
         if any([use_variances is None, use_variances is False]):
-            means, covs = self.get_prediction_with_uncertainty(X, get_cov=True, original_scale=False, **kwargs)
+            means, covs = self.get_prediction_with_uncertainty(
+                X,
+                get_cov=True,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             try:
                 return MultivariateNormal(means, covs + 1e-6 * torch.eye(covs.shape[-1],device=self.device))
             except Exception as exc1:
@@ -354,7 +385,12 @@ class NNEnsemble(Model):
                         return MultivariateNormal(means, covs + 1e-3 * torch.eye(covs.shape[-1],device=self.device))
 
         else:
-            means, variances = self.get_prediction_with_uncertainty(X, **kwargs)
+            means, variances = self.get_prediction_with_uncertainty(
+                X,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             if means.ndim in (1, 2):
                 means_squeeze, variances_squeeze = means.squeeze(), variances.squeeze()
                 if means_squeeze.ndim == 0:
@@ -375,7 +411,9 @@ class NNEnsemble(Model):
         self,
         q: torch.Tensor,
         get_cov: bool = False,
-        original_scale: bool = True,
+        *args: Any,
+        original_scale_x: bool = True,
+        original_scale_y: bool = True,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -383,12 +421,17 @@ class NNEnsemble(Model):
 
         :param q: A tensor with data we'll calculate prediction with uncertainty for
         :param get_cov: If True, get the covariance. Otherwise, get the variance.
-        :param original_scale: If True, apply an inverse scaling transformation to get the scaled
-            predictions back to the original scale. Otherwise, don't re-scale the predictions.
+        :param original_scale_x: If True, transform query inputs from original units to model units.
+        :param original_scale_y: If True, transform predictions back to original output units.
 
         :returns: A tuple containing the mean tensor and the variance (or covariance if
             `get_cov=True`) tensor
         """
+        reject_deprecated_original_scale(args, kwargs)
+        if original_scale_x:
+            if self.input_scaler is None:
+                raise RuntimeError("original_scale_x=True requires this model to have an input_scaler.")
+            q = self.input_scaler.transform(q)
         orig_input_shape = q.shape
         assert (
             q.shape[-1] == self.input_dim
@@ -427,7 +470,7 @@ class NNEnsemble(Model):
         val = val.reshape(self.n_estimators, *samples_shape, *self.batch_shape, self.output_dim).moveaxis(1, -2)
         assert val.shape[1:-1] == input_shape[:-1], "Something went wrong with reshaping."
 
-        if original_scale:
+        if original_scale_y:
             all_preds = self.output_scaler.inverse_transform(val, q)
         else:
             all_preds = val
@@ -519,7 +562,8 @@ class NNEnsemble(Model):
                 multi_fidelity=self.multi_fidelity,
                 fantasy_dict=fantasy_dict,
                 verbose=self.verbose,
-                output_scaler=self.output_scaler)
+                output_scaler=self.output_scaler,
+                input_scaler=self.input_scaler)
             if hasattr(self, "input_transform"):
                 fantasy_model.input_transform = self.input_transform
                 

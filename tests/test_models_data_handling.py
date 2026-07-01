@@ -39,8 +39,26 @@ def test_base_model_single_fidelity_normalizes_data(single_fidelity_data_file):
     assert model.full_train_X.dtype == torch.float32
     assert model.full_train_Y.dtype == torch.float32
     torch.testing.assert_close(model.full_train_Y_scaled, torch.tensor([[1.0], [0.8], [0.8], [0.0]]))
+    assert hasattr(model, "input_scaler")
+    torch.testing.assert_close(model.full_train_X, model.input_scaler.transform(model.X_orig))
     torch.testing.assert_close(model.full_train_X, model.X_orig)
     torch.testing.assert_close(model.bounds, torch.tensor(bounds, dtype=torch.float32))
+
+
+@pytest.mark.requires_botorch
+def test_base_model_single_fidelity_normalizes_non_unit_bounds(single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [2.0, 4.0]], dtype=np.float32)
+
+    model = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+
+    torch.testing.assert_close(model.full_train_X, model.X_orig / torch.tensor([2.0, 4.0]))
+    torch.testing.assert_close(model.full_train_X, model.input_scaler.transform(model.X_orig))
 
 
 @pytest.mark.requires_botorch
@@ -114,11 +132,28 @@ def test_gp_uses_scaled_training_outputs_and_public_prediction_units(monkeypatch
     torch.testing.assert_close(metadata["training_data"]["y"], wrapper.Y_orig.cpu())
     torch.testing.assert_close(metadata["bounds"], torch.tensor(bounds, dtype=torch.float32))
     assert not hasattr(model, "outcome_transform")
+    assert "input_scaler" in checkpoint
+    assert hasattr(model, "input_scaler")
     torch.testing.assert_close(model.train_targets.unsqueeze(-1), wrapper.full_train_Y_scaled)
-    mean_scaled, var_scaled = model.get_prediction_with_uncertainty(wrapper.full_train_X[:1], original_scale=False)
-    mean_original, var_original = model.get_prediction_with_uncertainty(wrapper.full_train_X[:1], original_scale=True)
+    mean_scaled, var_scaled = model.get_prediction_with_uncertainty(
+        wrapper.full_train_X[:1],
+        original_scale_x=False,
+        original_scale_y=False,
+    )
+    mean_original, var_original = model.get_prediction_with_uncertainty(
+        wrapper.full_train_X[:1],
+        original_scale_x=False,
+        original_scale_y=True,
+    )
+    mean_original_from_raw, var_original_from_raw = model.get_prediction_with_uncertainty(wrapper.X_orig[:1])
+    torch.testing.assert_close(mean_original, mean_original_from_raw)
+    torch.testing.assert_close(var_original, var_original_from_raw)
     torch.testing.assert_close(mean_original, wrapper.output_scaler.inverse_transform(mean_scaled, wrapper.full_train_X[:1]))
     torch.testing.assert_close(var_original, wrapper.output_scaler.inverse_variance(var_scaled, wrapper.full_train_X[:1]))
+    with pytest.raises(TypeError, match="original_scale was renamed"):
+        model.get_prediction_with_uncertainty(wrapper.full_train_X[:1], original_scale=False)
+    with pytest.raises(TypeError, match="original_scale was renamed"):
+        model.get_prediction_with_uncertainty(wrapper.full_train_X[:1], False, False)
 
 
 @pytest.mark.requires_botorch
@@ -142,6 +177,7 @@ def test_load_deepopt_model_loads_modern_gp_without_external_inputs(monkeypatch,
 
     assert isinstance(model, DeepOptSingleTaskGP)
     assert hasattr(model, "output_scaler")
+    assert hasattr(model, "input_scaler")
 
 
 @pytest.mark.requires_botorch
