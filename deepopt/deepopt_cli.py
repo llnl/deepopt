@@ -377,13 +377,6 @@ def learn(
     depends_on="risk_measure",
 )
 @click.option(
-    "--n-fantasies",
-    help="Number of fantasy models to use.",
-    default=Defaults.n_fantasies,
-    type=click.INT,
-    show_default=True,
-)
-@click.option(
     "--propose-best",
     help="Select first candidate using surrogate optimum.",
     is_flag=True,
@@ -417,7 +410,6 @@ def optimize(
     risk_level,
     risk_n_deltas,
     x_stddev,
-    n_fantasies,
     propose_best,
     integer_fidelities,
 ) -> None:
@@ -444,6 +436,13 @@ def optimize(
         )
     else:
         model = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
+        if config_file is not None:
+            optimize_config_settings = ConfigSettings(checkpoint_metadata["model_type"], config_file=config_file)
+            if "optimization" in optimize_config_settings:
+                model.config_settings.set_setting(
+                    "optimization",
+                    optimize_config_settings.get_setting("optimization"),
+                )
 
     risk_measure = None if risk_measure == "None" else risk_measure
     if risk_measure:
@@ -465,7 +464,6 @@ def optimize(
         risk_level=risk_level,
         risk_n_deltas=risk_n_deltas,
         x_stddev=x_stddev,
-        n_fantasies=n_fantasies,
         propose_best=propose_best,
         integer_fidelities=integer_fidelities,
     )

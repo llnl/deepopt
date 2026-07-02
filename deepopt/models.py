@@ -4,6 +4,7 @@ It's where we handle the configuration of each model (i.e. how we process
 the `learn` and `optimize` commands for each model).
 """
 import json
+import os
 import random
 import warnings
 from abc import ABC, abstractmethod
@@ -40,7 +41,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler, TensorDataset
 
 from deepopt.acquisition import qMaxValueEntropy, qMultiFidelityLowerBoundMaxValueEntropy, qMultiFidelityMaxValueEntropy
 from deepopt.configuration import ConfigSettings
-from deepopt.defaults import Defaults
+from deepopt.defaults import Defaults, OPTIMIZATION_PROFILES
 from deepopt.deltaenc import DeltaEnc
 from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.nn_ensemble import NNEnsemble
@@ -51,6 +52,24 @@ from deepopt.surrogate_utils import create_optimizer
 
 DEEPOPT_CHECKPOINT_KEY = "deepopt_checkpoint"
 DEEPOPT_CHECKPOINT_SCHEMA_VERSION = 1
+OPTIMIZATION_SETTING_KEYS = frozenset(next(iter(OPTIMIZATION_PROFILES.values())).keys())
+OPTIMIZATION_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "TORCH_NUM_THREADS")
+
+
+@dataclass(frozen=True)
+class AcquisitionOptimizationSettings:
+    num_restarts_high: int
+    num_restarts_low: int
+    raw_samples_high: int
+    raw_samples_low: int
+    batch_limit_high: int
+    batch_limit_low: int
+    maxiter: int
+    n_fantasies: int
+    torch_num_threads: Optional[Union[int, str]]
+    torch_num_threads_fraction: float
+    torch_num_interop_threads: Optional[int]
+
 
 
 def _torch_load(learner_file: str, map_location: str = "cpu", weights_only: bool = False):
@@ -497,6 +516,100 @@ class DeepoptBaseModel(ABC):
     ) -> torch.Tensor:
         return self._get_risk_measure_values("CVaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
 
+    def _resolve_optimization_settings(
+        self,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
+    ) -> AcquisitionOptimizationSettings:
+        if optimization_settings is not None:
+            return optimization_settings
+        optimization_config = self.config_settings.config_settings.get("optimization", {})
+        if optimization_config is None:
+            optimization_config = {}
+        if not isinstance(optimization_config, dict):
+            raise ValueError("The optimization config section must be a mapping.")
+        profile = optimization_config.get("profile", Defaults.optimization_profile)
+        if profile not in OPTIMIZATION_PROFILES:
+            raise ValueError(f"Unknown optimization profile {profile}. Valid profiles: {sorted(OPTIMIZATION_PROFILES)}")
+        unknown_keys = set(optimization_config).difference(OPTIMIZATION_SETTING_KEYS | {"profile"})
+        if unknown_keys:
+            raise ValueError(f"Unknown optimization setting(s): {sorted(unknown_keys)}")
+        settings = dict(OPTIMIZATION_PROFILES[profile])
+        settings.update({key: value for key, value in optimization_config.items() if key != "profile"})
+        return self._validate_optimization_settings(settings)
+
+    def _validate_optimization_settings(self, settings: Dict[str, Any]) -> AcquisitionOptimizationSettings:
+        positive_int_keys = (
+            "num_restarts_high",
+            "num_restarts_low",
+            "raw_samples_high",
+            "raw_samples_low",
+            "batch_limit_high",
+            "batch_limit_low",
+            "maxiter",
+            "n_fantasies",
+        )
+        for key in positive_int_keys:
+            if isinstance(settings[key], bool) or int(settings[key]) <= 0:
+                raise ValueError(f"optimization.{key} must be a positive integer.")
+            settings[key] = int(settings[key])
+        fraction = float(settings["torch_num_threads_fraction"])
+        if not 0 < fraction <= 1:
+            raise ValueError("optimization.torch_num_threads_fraction must be in (0, 1].")
+        settings["torch_num_threads_fraction"] = fraction
+        torch_num_threads = settings["torch_num_threads"]
+        if torch_num_threads is not None and torch_num_threads != "auto":
+            if isinstance(torch_num_threads, bool) or int(torch_num_threads) <= 0:
+                raise ValueError("optimization.torch_num_threads must be 'auto', null, or a positive integer.")
+            settings["torch_num_threads"] = int(torch_num_threads)
+        torch_num_interop_threads = settings["torch_num_interop_threads"]
+        if torch_num_interop_threads is not None:
+            if isinstance(torch_num_interop_threads, bool) or int(torch_num_interop_threads) <= 0:
+                raise ValueError("optimization.torch_num_interop_threads must be null or a positive integer.")
+            settings["torch_num_interop_threads"] = int(torch_num_interop_threads)
+        return AcquisitionOptimizationSettings(**settings)
+
+    @staticmethod
+    def _available_cpu_count() -> int:
+        if hasattr(os, "sched_getaffinity"):
+            return len(os.sched_getaffinity(0))
+        for env_var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+            value = os.environ.get(env_var)
+            if value:
+                return int(value)
+        return psutil.cpu_count(logical=False) or os.cpu_count() or 1
+
+    @classmethod
+    def _resolve_auto_torch_num_threads(cls, fraction: float) -> int:
+        available_cpus = cls._available_cpu_count()
+        if available_cpus <= 8:
+            return available_cpus
+        return max(1, int(fraction * available_cpus))
+
+    def _configure_torch_threads(self, settings: AcquisitionOptimizationSettings) -> None:
+        if self.device != "cpu":
+            return
+        torch_num_threads = settings.torch_num_threads
+        if torch_num_threads == "auto":
+            if any(os.environ.get(env_var) for env_var in OPTIMIZATION_THREAD_ENV_VARS):
+                torch_num_threads = None
+            else:
+                torch_num_threads = self._resolve_auto_torch_num_threads(settings.torch_num_threads_fraction)
+        if torch_num_threads is not None:
+            torch.set_num_threads(torch_num_threads)
+        if settings.torch_num_interop_threads is not None:
+            try:
+                torch.set_num_interop_threads(settings.torch_num_interop_threads)
+            except RuntimeError as exc:
+                warnings.warn(f"Could not set torch interop threads: {exc}", RuntimeWarning)
+        if self.verbose:
+            print(
+                f"Torch threads: intraop={torch.get_num_threads()}, "
+                f"interop={torch.get_num_interop_threads()}"
+            )
+
+    def _make_acq_options(self, batch_limit: int, maxiter: int) -> Dict[str, int]:
+        return {"batch_limit": batch_limit, "maxiter": maxiter, "seed": self.random_seed}
+
     def _get_candidates_mf(
         self,
         model: Type[Model],
@@ -505,7 +618,7 @@ class DeepoptBaseModel(ABC):
         fidelity_cost: np.ndarray,
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -533,6 +646,8 @@ class DeepoptBaseModel(ABC):
         :returns: A two element tuple containing a q x d-dim tensor of generated candidates
             and an associated acquisition value.
         """
+        settings = self._resolve_optimization_settings(optimization_settings)
+        n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
         bounds[1, -1] = self.num_fidelities - 1
 
@@ -554,9 +669,9 @@ class DeepoptBaseModel(ABC):
                 acq_function=curr_val_acqf,
                 bounds=bounds[:, :-1],
                 q=1,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
-                options={"batch_limit": 10, "maxiter": 200, "seed": self.random_seed},
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
             q-=1
             if q==0:
@@ -595,9 +710,9 @@ class DeepoptBaseModel(ABC):
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
-                options={"seed": self.random_seed},
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
         elif acq_method == "KG":
             if not propose_best:
@@ -615,9 +730,9 @@ class DeepoptBaseModel(ABC):
                     acq_function=curr_val_acqf,
                     bounds=bounds[:, :-1],
                     q=1,
-                    num_restarts=Defaults.num_restarts_high,
-                    raw_samples=Defaults.raw_samples_high,
-                    options={"batch_limit": 10, "maxiter": 200, "seed": self.random_seed},
+                    num_restarts=settings.num_restarts_high,
+                    raw_samples=settings.raw_samples_high,
+                    options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
                 )
             
 
@@ -636,9 +751,9 @@ class DeepoptBaseModel(ABC):
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
-                num_restarts=Defaults.num_restarts_low,
-                raw_samples=Defaults.raw_samples_low,
-                options={"batch_limit": 5, "maxiter": 200, "seed": self.random_seed},
+                num_restarts=settings.num_restarts_low,
+                raw_samples=settings.raw_samples_low,
+                options=self._make_acq_options(settings.batch_limit_low, settings.maxiter),
             )
         if propose_best:
             best_candidate = torch.concat([best_candidate.reshape(1,-1),(self.num_fidelities-1)*torch.ones(1,1,device=self.device)],axis=1)
@@ -654,7 +769,7 @@ class DeepoptBaseModel(ABC):
         q: int,
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[Any, Any]:
         """
@@ -680,6 +795,8 @@ class DeepoptBaseModel(ABC):
         :returns: A two element tuple containing a q x d-dim tensor of generated candidates
             and an associated acquisition value.
         """
+        settings = self._resolve_optimization_settings(optimization_settings)
+        n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
 
         if propose_best:
@@ -690,8 +807,9 @@ class DeepoptBaseModel(ABC):
                 ),
                 bounds=bounds,
                 q=1,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
             q-=1
             if q==0:
@@ -725,8 +843,9 @@ class DeepoptBaseModel(ABC):
                     ),
                     bounds=bounds,
                     q=1,
-                    num_restarts=Defaults.num_restarts_high,
-                    raw_samples=Defaults.raw_samples_high,
+                    num_restarts=settings.num_restarts_high,
+                    raw_samples=settings.raw_samples_high,
+                    options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
                 )
             
             q_acq = qKnowledgeGradient(
@@ -741,10 +860,13 @@ class DeepoptBaseModel(ABC):
             q_acq,
             bounds=bounds,
             q=q,
-            num_restarts=Defaults.num_restarts_high,
-            raw_samples=Defaults.raw_samples_low if acq_method in ["MaxValEntropy", "KG"] else Defaults.raw_samples_high,
+            num_restarts=settings.num_restarts_low if acq_method in ["MaxValEntropy", "KG"] else settings.num_restarts_high,
+            raw_samples=settings.raw_samples_low if acq_method in ["MaxValEntropy", "KG"] else settings.raw_samples_high,
             sequential=(acq_method == "MaxValEntropy"),
-            options={"seed": self.random_seed},
+            options=self._make_acq_options(
+                settings.batch_limit_low if acq_method in ["MaxValEntropy", "KG"] else settings.batch_limit_high,
+                settings.maxiter,
+            ),
         )
         if propose_best:
             candidates = torch.concat([best_candidate.reshape(1,-1),candidates],axis=0)
@@ -759,7 +881,7 @@ class DeepoptBaseModel(ABC):
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
         fidelity_cost: Optional[np.ndarray] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[Any, Any]:
         """
@@ -797,7 +919,7 @@ class DeepoptBaseModel(ABC):
                 fidelity_cost=fidelity_cost,
                 risk_objective=risk_objective,
                 risk_n_deltas=risk_n_deltas,
-                n_fantasies=n_fantasies,
+                optimization_settings=optimization_settings,
                 propose_best=propose_best,
             )
         else:
@@ -807,7 +929,7 @@ class DeepoptBaseModel(ABC):
                 q=q,
                 risk_objective=risk_objective,
                 risk_n_deltas=risk_n_deltas,
-                n_fantasies=n_fantasies,
+                optimization_settings=optimization_settings,
                 propose_best=propose_best,
             )
         return candidates, acq_value
@@ -823,9 +945,9 @@ class DeepoptBaseModel(ABC):
         risk_level: float = None,
         risk_n_deltas: int = None,
         x_stddev: np.ndarray = None,
-        n_fantasies: int = Defaults.n_fantasies,
         propose_best: bool = False,
-        integer_fidelities: bool = False
+        integer_fidelities: bool = False,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
     ) -> None:
         """
         The function to process the `deepopt optimize` command.
@@ -844,14 +966,14 @@ class DeepoptBaseModel(ABC):
         :param risk_level: The risk level (a float between 0 and 1)
         :param risk_n_deltas: The number of input perturbations to sample for X's uncertainty
         :param x_stddev: Uncertainity in X (stddev) in each dimension
-        :param n_fantasies: Number of fantasies to generate. The higher this number the more accurate
-            the model (at the expense of model complexity and performance).
         :param propose_best: If `True`, the first candidate is selected to maximize the surrogate posterior,
             while the rest are acquired by the specified acquisition method. If `False`, acquire all points
             with the acquisition method as usual. 
         :param integer_fidelities: If `True`, converts fidelity column to integers when saving candidate .npy file.
             Saved numpy array had dtype 'object' and requires `allow_pickle=True` option in `np.load` to read.
         """
+        optimization_settings = self._resolve_optimization_settings(optimization_settings)
+        self._configure_torch_threads(optimization_settings)
         print(
             f"""
             Infile: {self.data_file}
@@ -893,7 +1015,7 @@ class DeepoptBaseModel(ABC):
             risk_objective=risk_objective,
             risk_n_deltas=risk_n_deltas,
             fidelity_cost=fidelity_cost,
-            n_fantasies=n_fantasies,
+            optimization_settings=optimization_settings,
             propose_best=propose_best,
         )
         if self.multi_fidelity:

@@ -44,6 +44,7 @@ def test_cli_help_lists_commands_and_core_options():
     assert "--learner-file" in result.output
     assert "--acq-method" in result.output
     assert "--risk-measure" in result.output
+    assert "--n-fantasies" not in result.output
 
 
 def test_learn_cli_parses_bounds_and_invokes_model(monkeypatch, single_fidelity_data_file, tmp_path):
@@ -222,6 +223,59 @@ def test_modern_optimize_cli_uses_checkpoint_metadata(monkeypatch, tmp_path):
     model, kwargs = calls[0]
     assert model.config_settings.get_setting("model_type") == "GP"
     assert kwargs["learner_file"] == str(checkpoint)
+
+
+def test_modern_optimize_cli_applies_config_file_optimization_overrides(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "learner.ckpt"
+    config_file = tmp_path / "opt.yaml"
+    config_file.write_text("optimization:\n  profile: fast\n  num_restarts_high: 3\n")
+    X = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+    y = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    torch.save(
+        {
+            "state_dict": {},
+            DEEPOPT_CHECKPOINT_KEY: {
+                "schema_version": 1,
+                "model_type": "GP",
+                "training_data": {"X": X, "y": y},
+                "bounds": torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+                "config_settings": {"model_type": "GP", "optimization": {"profile": "cpu_large"}},
+                "multi_fidelity": False,
+            },
+        },
+        checkpoint,
+    )
+    calls = []
+
+    def fake_optimize(self, **kwargs):
+        calls.append(self)
+
+    monkeypatch.setattr(GPModel, "optimize", fake_optimize)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        deepopt_cli,
+        [
+            "optimize",
+            "-o",
+            str(tmp_path / "suggested.npy"),
+            "-l",
+            str(checkpoint),
+            "-a",
+            "EI",
+            "-c",
+            str(config_file),
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0].config_settings.get_setting("optimization") == {
+        "profile": "fast",
+        "num_restarts_high": 3,
+    }
 
 
 def test_legacy_optimize_cli_requires_infile_and_bounds(tmp_path):

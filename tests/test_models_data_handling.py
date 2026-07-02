@@ -9,6 +9,7 @@ pytest.importorskip("ray")
 from deepopt.configuration import ConfigSettings
 from deepopt.models import (
     DEEPOPT_CHECKPOINT_KEY,
+    AcquisitionOptimizationSettings,
     DeepoptBaseModel,
     DeepOptSingleTaskGP,
     FidelityCostModel,
@@ -223,6 +224,195 @@ def test_model_agnostic_loader_rejects_legacy_checkpoint(tmp_path):
 
     with pytest.raises(ValueError, match="legacy explicit path"):
         load_deepopt_model(str(checkpoint), device="cpu")
+
+
+def test_optimization_settings_resolve_profile_with_overrides(single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    settings.set_setting("optimization", {"profile": "fast", "num_restarts_high": 11, "torch_num_threads": 3})
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    model = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+
+    opt_settings = model._resolve_optimization_settings()
+
+    assert opt_settings.num_restarts_high == 11
+    assert opt_settings.raw_samples_high == 2048
+    assert opt_settings.batch_limit_high == 8
+    assert opt_settings.n_fantasies == 32
+    assert opt_settings.torch_num_threads == 3
+
+
+def test_auto_torch_threads_use_all_small_allocations_and_fraction_large(monkeypatch):
+    monkeypatch.setattr(DeepoptBaseModel, "_available_cpu_count", staticmethod(lambda: 8))
+    assert DeepoptBaseModel._resolve_auto_torch_num_threads(0.8) == 8
+    monkeypatch.setattr(DeepoptBaseModel, "_available_cpu_count", staticmethod(lambda: 200))
+    assert DeepoptBaseModel._resolve_auto_torch_num_threads(0.8) == 160
+
+
+def test_configure_torch_threads_respects_auto_and_explicit(monkeypatch, single_fidelity_data_file):
+    settings = ConfigSettings("GP")
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    model = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+    calls = []
+    monkeypatch.setattr(DeepoptBaseModel, "_available_cpu_count", staticmethod(lambda: 100))
+    monkeypatch.setattr(torch, "set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr(torch, "set_num_interop_threads", lambda value: calls.append(("interop", value)))
+
+    model._configure_torch_threads(
+        AcquisitionOptimizationSettings(
+            num_restarts_high=1,
+            num_restarts_low=1,
+            raw_samples_high=1,
+            raw_samples_low=1,
+            batch_limit_high=1,
+            batch_limit_low=1,
+            maxiter=1,
+            n_fantasies=1,
+            torch_num_threads="auto",
+            torch_num_threads_fraction=0.7,
+            torch_num_interop_threads=2,
+        )
+    )
+
+    assert calls == [("threads", 70), ("interop", 2)]
+
+
+def test_single_fidelity_candidate_generation_uses_resolved_optimization_settings(
+    monkeypatch, single_fidelity_data_file
+):
+    settings = ConfigSettings("GP")
+    settings.set_setting(
+        "optimization",
+        {
+            "profile": "fast",
+            "num_restarts_high": 9,
+            "raw_samples_high": 33,
+            "batch_limit_high": 7,
+            "maxiter": 22,
+        },
+    )
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+    captured = {}
+
+    monkeypatch.setattr("deepopt.models.qExpectedImprovement", lambda *args, **kwargs: object())
+
+    def fake_optimize_acqf(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.optimize_acqf", fake_optimize_acqf)
+
+    wrapper._get_candidates_sf(model=object(), acq_method="EI", q=1)
+
+    assert captured["num_restarts"] == 9
+    assert captured["raw_samples"] == 33
+    assert captured["options"] == {"batch_limit": 7, "maxiter": 22, "seed": wrapper.random_seed}
+
+
+def test_single_fidelity_expensive_acquisitions_use_low_restart_settings(
+    monkeypatch, single_fidelity_data_file
+):
+    settings = ConfigSettings("GP")
+    settings.set_setting(
+        "optimization",
+        {
+            "profile": "fast",
+            "num_restarts_high": 9,
+            "num_restarts_low": 4,
+            "raw_samples_low": 30,
+            "batch_limit_low": 3,
+            "maxiter": 22,
+            "n_fantasies": 5,
+        },
+    )
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+    captured = {}
+
+    def fake_mes(*args, **kwargs):
+        return object()
+
+    def fake_optimize_acqf(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.qMaxValueEntropy", fake_mes)
+    monkeypatch.setattr("deepopt.models.optimize_acqf", fake_optimize_acqf)
+
+    wrapper._get_candidates_sf(model=object(), acq_method="MaxValEntropy", q=1)
+
+    assert captured["num_restarts"] == 4
+    assert captured["raw_samples"] == 30
+    assert captured["options"] == {"batch_limit": 3, "maxiter": 22, "seed": wrapper.random_seed}
+
+
+def test_multi_fidelity_candidate_generation_uses_resolved_optimization_settings(
+    monkeypatch, multi_fidelity_data_file
+):
+    settings = ConfigSettings("GP")
+    settings.set_setting(
+        "optimization",
+        {
+            "profile": "fast",
+            "num_restarts_high": 10,
+            "raw_samples_high": 34,
+            "batch_limit_high": 6,
+            "maxiter": 21,
+            "n_fantasies": 5,
+        },
+    )
+    bounds = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(multi_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        multi_fidelity=True,
+        device="cpu",
+    )
+    captured = {}
+
+    def fake_mf_mes(*args, **kwargs):
+        captured["n_fantasies"] = kwargs["num_fantasies"]
+        return object()
+
+    def fake_optimize_acqf_mixed(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2, 1.0]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.qMultiFidelityMaxValueEntropy", fake_mf_mes)
+    monkeypatch.setattr("deepopt.models.optimize_acqf_mixed", fake_optimize_acqf_mixed)
+
+    wrapper._get_candidates_mf(
+        model=object(),
+        acq_method="MaxValEntropy",
+        q=1,
+        fidelity_cost=np.array([1.0, 3.0], dtype=np.float32),
+    )
+
+    assert captured["n_fantasies"] == 5
+    assert captured["num_restarts"] == 10
+    assert captured["raw_samples"] == 34
+    assert captured["options"] == {"batch_limit": 6, "maxiter": 21, "seed": wrapper.random_seed}
 
 
 def test_fidelity_cost_model_uses_rounded_last_column():

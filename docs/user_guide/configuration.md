@@ -2,7 +2,7 @@
 
 !!! note
 
-    Currently only nnEnsemble and delUQ models can be configured; GP models will be run as-is.
+    Model training hyperparameters are only configurable for nnEnsemble and delUQ models; GP model training runs as-is. Optimization settings apply to all model types.
 
 The DeepOpt library allows users to define custom configurations for training your model and conducting Bayesian optimization. To ensure a flexible and user-friendly experience, DeepOpt supports configuration through YAML and JSON files. This guide is designed to walk you through the available options and best practices for setting up your configuration files.
 
@@ -30,3 +30,39 @@ There are several configuration options for nnEnsemble and delUQ models that can
 | variance         | The scale of the frequency distribution ("dist") when using Fourier features. A "uniform" distribution is constant between +/- scale, a "gaussian" uses scale as the standard deviation, and the "laplace" distribution uses scale as the exponential decay factor.</br></br> This parameter is optimized during hyperparameter tuning, so it is not necessary to set precisely.        | 0.0015625 |
 | batchnorm        | Whether to use batchnorm regularization (True) or not (False)        | False     |
 | weight_decay     | Strength of weight decay (L2 penalty) to use during optimization        | 0     |
+
+## Optimization Settings
+
+Candidate generation can also be configured with an `optimization` section in the same YAML/JSON config file. If this section is omitted, DeepOpt uses the `cpu_large` profile, which is intended for single-node runs with many CPU cores.
+
+```yaml
+optimization:
+  profile: cpu_large
+  batch_limit_high: 24
+  torch_num_threads: auto
+```
+
+Profiles provide sensible defaults:
+
+| Profile | Purpose |
+| ------- | ------- |
+| `cpu_large` | Default profile for large single-node CPU allocations. |
+| `balanced` | Legacy-compatible optimization settings. |
+| `fast` | Lower-cost settings for smoke tests or quick iteration. |
+
+Any setting specified alongside `profile` overrides that profile value. If `profile` is omitted, DeepOpt starts from `cpu_large` and applies the provided overrides.
+
+Advanced optimization settings include:
+
+| Option | Description |
+| ------ | ----------- |
+| `num_restarts_high` / `num_restarts_low` | Number of multistart local optimizations for normal and expensive acquisition paths. |
+| `raw_samples_high` / `raw_samples_low` | Number of raw Sobol samples used to initialize local optimization. |
+| `batch_limit_high` / `batch_limit_low` | Number of restart batches evaluated together. Larger values can improve CPU/GPU utilization but increase memory use. |
+| `maxiter` | Maximum local optimizer iterations. |
+| `n_fantasies` | Number of fantasy models for KG/MES-family acquisition functions. Larger values can improve Monte Carlo accuracy but can be much slower. |
+| `torch_num_threads` | PyTorch intra-op thread count. Use `auto`, an integer, or `null`. |
+| `torch_num_threads_fraction` | Fraction of available CPUs to use when `torch_num_threads: auto` and more than 8 CPUs are available. Default is `0.8`. |
+| `torch_num_interop_threads` | PyTorch inter-op thread count. Use an integer or `null`. |
+
+For `torch_num_threads: auto`, DeepOpt uses all available CPUs on small machines (8 or fewer CPUs). On larger allocations it uses `floor(torch_num_threads_fraction * available_cpus)`, preferring CPU affinity and Slurm CPU variables when available. If thread environment variables such as `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, or `TORCH_NUM_THREADS` are already set, DeepOpt does not override PyTorch's intra-op thread count unless an explicit integer is provided.

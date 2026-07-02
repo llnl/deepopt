@@ -78,7 +78,7 @@ class ConfigSettings:
                 if self.config_file.endswith(".yaml"):
                     config = yaml.safe_load(file)
                 elif self.config_file.endswith(".json"):
-                    config = json.loads(file)
+                    config = json.load(file)
                 else:
                     raise ValueError(f"The config file {self.config_file} must be either a yaml file or a json file.")
 
