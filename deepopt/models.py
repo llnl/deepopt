@@ -58,6 +58,26 @@ OPTIMIZATION_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_
 
 @dataclass(frozen=True)
 class AcquisitionOptimizationSettings:
+    """
+    Resolved acquisition optimizer settings.
+
+    The ``high`` settings are used for normal acquisition optimization paths, while
+    the ``low`` settings are used for more expensive acquisition functions such as
+    KG and MaxValEntropy. Thread settings apply only to CPU optimization.
+
+    :cvar num_restarts_high: Multistart local optimizations for high-budget paths.
+    :cvar num_restarts_low: Multistart local optimizations for low-budget paths.
+    :cvar raw_samples_high: Sobol samples used to initialize high-budget paths.
+    :cvar raw_samples_low: Sobol samples used to initialize low-budget paths.
+    :cvar batch_limit_high: Restart batches evaluated together for high-budget paths.
+    :cvar batch_limit_low: Restart batches evaluated together for low-budget paths.
+    :cvar maxiter: Maximum iterations for each local optimizer run.
+    :cvar n_fantasies: Number of fantasy models used by KG/MES-family acquisitions.
+    :cvar torch_num_threads: PyTorch intra-op threads, ``"auto"``, or ``None``.
+    :cvar torch_num_threads_fraction: Fraction of available CPUs used by ``"auto"``.
+    :cvar torch_num_interop_threads: PyTorch inter-op thread count, or ``None``.
+    """
+
     num_restarts_high: int
     num_restarts_low: int
     raw_samples_high: int
@@ -73,6 +93,14 @@ class AcquisitionOptimizationSettings:
 
 
 def _torch_load(learner_file: str, map_location: str = "cpu", weights_only: bool = False):
+    """
+    Load a PyTorch checkpoint across supported PyTorch versions.
+
+    :param learner_file: Path to the checkpoint file.
+    :param map_location: Device mapping passed to ``torch.load``.
+    :param weights_only: Whether to request PyTorch's restricted checkpoint loader.
+    :returns: The object loaded from ``learner_file``.
+    """
     try:
         return torch.load(learner_file, map_location=map_location, weights_only=weights_only)
     except TypeError:
@@ -80,6 +108,18 @@ def _torch_load(learner_file: str, map_location: str = "cpu", weights_only: bool
 
 
 def get_checkpoint_metadata(learner_file: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
+    """
+    Read self-describing DeepOpt metadata from a checkpoint.
+
+    Legacy checkpoints that do not contain ``deepopt_checkpoint`` metadata return
+    ``None``. Checkpoints that contain malformed DeepOpt metadata raise
+    ``ValueError`` so callers can distinguish old files from broken modern files.
+
+    :param learner_file: Path to the checkpoint file saved with ``torch.save``.
+    :param map_location: Device mapping passed to ``torch.load``.
+    :returns: Metadata with schema version, model type, training data, bounds, and config settings, or ``None`` for legacy checkpoints.
+    :raises ValueError: If metadata is present but has an unsupported schema, invalid model type, or missing required fields.
+    """
     try:
         checkpoint = _torch_load(learner_file, map_location=map_location, weights_only=True)
     except Exception:
@@ -110,10 +150,22 @@ def get_checkpoint_metadata(learner_file: str, map_location: str = "cpu") -> Opt
 
 
 def is_self_describing_checkpoint(learner_file: str) -> bool:
+    """
+    Return whether a checkpoint contains valid DeepOpt metadata.
+
+    :param learner_file: Path to the checkpoint file.
+    :returns: ``True`` if ``get_checkpoint_metadata`` returns metadata, otherwise ``False``.
+    """
     return get_checkpoint_metadata(learner_file) is not None
 
 
 def _config_settings_from_checkpoint(metadata: Dict[str, Any]) -> ConfigSettings:
+    """
+    Rebuild configuration settings from checkpoint metadata.
+
+    :param metadata: Valid self-describing checkpoint metadata.
+    :returns: A ``ConfigSettings`` object populated from the saved settings.
+    """
     config_settings = ConfigSettings(metadata["model_type"])
     config_settings.config_settings.update(metadata.get("config_settings", {}))
     config_settings.config_file = None
@@ -121,6 +173,15 @@ def _config_settings_from_checkpoint(metadata: Dict[str, Any]) -> ConfigSettings
 
 
 def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool = False) -> "DeepoptBaseModel":
+    """
+    Load the appropriate DeepOpt wrapper from a self-describing checkpoint.
+
+    :param learner_file: Path to a checkpoint containing ``deepopt_checkpoint`` metadata.
+    :param device: Device requested for the wrapper and underlying model.
+    :param verbose: If ``True``, enable verbose model evaluation output where supported.
+    :returns: A ``GPModel``, ``DelUQModel``, or ``NNEnsembleModel`` initialized from checkpoint metadata.
+    :raises ValueError: If the checkpoint is legacy or has invalid metadata.
+    """
     metadata = get_checkpoint_metadata(learner_file)
     if metadata is None:
         raise ValueError(
@@ -146,6 +207,14 @@ def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool 
 
 
 def load_deepopt_model(learner_file: str, device: str = "auto", verbose: bool = False) -> Type[Model]:
+    """
+    Load the underlying BoTorch-compatible model from a self-describing checkpoint.
+
+    :param learner_file: Path to a checkpoint containing ``deepopt_checkpoint`` metadata.
+    :param device: Device requested for the wrapper and underlying model.
+    :param verbose: If ``True``, enable verbose model evaluation output where supported.
+    :returns: The model returned by the reconstructed wrapper's ``load_model`` method.
+    """
     wrapper = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
     return wrapper.load_model(learner_file)
 
@@ -285,6 +354,11 @@ class DeepoptBaseModel(ABC):
         random.seed(self.random_seed)
 
     def _checkpoint_metadata(self) -> Dict[str, Any]:
+        """
+        Build metadata needed to reload this wrapper without the original CLI inputs.
+
+        :returns: Self-describing checkpoint metadata stored under ``deepopt_checkpoint``.
+        """
         return {
             "schema_version": DEEPOPT_CHECKPOINT_SCHEMA_VERSION,
             "model_type": self.config_settings.get_setting("model_type"),
@@ -293,6 +367,7 @@ class DeepoptBaseModel(ABC):
                 "y": self.Y_orig.detach().cpu(),
             },
             "bounds": self.bounds.detach().cpu(),
+            # Save config settings verbatim so optimize-time loading preserves user choices.
             "config_settings": dict(self.config_settings.config_settings),
             "random_seed": self.random_seed,
             "k_folds": self.k_folds,
@@ -503,6 +578,16 @@ class DeepoptBaseModel(ABC):
         risk_n_deltas: int = 128,
         learner_file: Optional[str] = None,
     ) -> torch.Tensor:
+        """
+        Evaluate Value-at-Risk at query points under input perturbations.
+
+        :param X_query: Query inputs in model units. If ``None``, evaluate at the training inputs.
+        :param risk_level: Quantile level between 0 and 1.
+        :param x_stddev: Input standard deviations in original input units, one value per input dimension.
+        :param risk_n_deltas: Number of input perturbations sampled for the risk objective.
+        :param learner_file: Optional checkpoint path; defaults to this wrapper's checkpoint.
+        :returns: VaR values with one value per query point.
+        """
         return self._get_risk_measure_values("VaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
 
     def get_cvar(
@@ -514,6 +599,16 @@ class DeepoptBaseModel(ABC):
         risk_n_deltas: int = 128,
         learner_file: Optional[str] = None,
     ) -> torch.Tensor:
+        """
+        Evaluate Conditional Value-at-Risk at query points under input perturbations.
+
+        :param X_query: Query inputs in model units. If ``None``, evaluate at the training inputs.
+        :param risk_level: Tail level between 0 and 1.
+        :param x_stddev: Input standard deviations in original input units, one value per input dimension.
+        :param risk_n_deltas: Number of input perturbations sampled for the risk objective.
+        :param learner_file: Optional checkpoint path; defaults to this wrapper's checkpoint.
+        :returns: CVaR values with one value per query point.
+        """
         return self._get_risk_measure_values("CVaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
 
     def _resolve_optimization_settings(
@@ -956,7 +1051,7 @@ class DeepoptBaseModel(ABC):
 
         :param outfile: The name of the file to save the proposed candidates in
         :param learner_file: The name of the checkpoint file produced by `learn`
-        :param acq_method: The acquisiton function. Single-fidelity options:
+        :param acq_method: The acquisition function. Single-fidelity options:
             'KG', 'MaxValEntropy', 'EI', or 'NEI'. Multi-fidelity options: 'KG' or
             'MaxValEntropy'
         :param num_candidates: The number of candidates
@@ -965,7 +1060,7 @@ class DeepoptBaseModel(ABC):
                 or 'VaR' (Value-at-Risk).
         :param risk_level: The risk level (a float between 0 and 1)
         :param risk_n_deltas: The number of input perturbations to sample for X's uncertainty
-        :param x_stddev: Uncertainity in X (stddev) in each dimension
+        :param x_stddev: Uncertainty in X (stddev) in each dimension
         :param propose_best: If `True`, the first candidate is selected to maximize the surrogate posterior,
             while the rest are acquired by the specified acquisition method. If `False`, acquire all points
             with the acquisition method as usual. 
@@ -1025,6 +1120,7 @@ class DeepoptBaseModel(ABC):
             candidates = candidates * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         candidates_npy = candidates.cpu().detach().numpy()
         if integer_fidelities and self.multi_fidelity:
+            # Mixed float inputs and integer fidelities require object dtype in the saved array.
             candidates_npy = np.concatenate([candidates_npy[:,:-1].astype(np.float32),candidates_npy[:,-1:].astype(int)],axis=1,dtype='object')
         np.save(outfile, candidates_npy)
 
@@ -1045,6 +1141,12 @@ class DeepOptGPMixin:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Return GP posterior mean and variance or covariance.
+
+        :param q: Query tensor with shape ``... x q x d``.
+        :param get_cov: If ``True``, return the joint ``q x q`` covariance; otherwise return pointwise variance.
+        :param original_scale_x: If ``True``, transform query inputs from original units to model units.
+        :param original_scale_y: If ``True``, transform posterior statistics back to original output units.
+        :returns: ``(mean, variance)`` or ``(mean, covariance)`` depending on ``get_cov``.
         """
         reject_deprecated_original_scale(args, kwargs)
         q_model = q
@@ -1068,11 +1170,15 @@ class DeepOptGPMixin:
 
 
 class DeepOptSingleTaskGP(DeepOptGPMixin, SingleTaskGP):
-    pass
+    """
+    Single-fidelity GP model with DeepOpt prediction scaling helpers.
+    """
 
 
 class DeepOptSingleTaskMultiFidelityGP(DeepOptGPMixin, SingleTaskMultiFidelityGP):
-    pass
+    """
+    Multi-fidelity GP model with DeepOpt prediction scaling helpers.
+    """
 
 
 class GPModel(DeepoptBaseModel):
@@ -1383,6 +1489,12 @@ class DelUQModel(DeepoptBaseModel):
         return model
 
 class NNEnsembleModel(DeepoptBaseModel):
+    """
+    DeepOpt wrapper for training, loading, and optimizing NN ensemble surrogates.
+
+    This class has the same class variables as ``DeepoptBaseModel``.
+    """
+
     def train(self, outfile: str) -> Type[Model]:
         """
         Train the NN Ensemble surrogate and save the model produced. 

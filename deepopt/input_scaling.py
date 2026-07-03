@@ -13,6 +13,13 @@ DEPRECATED_ORIGINAL_SCALE_ERROR = (
 
 
 def reject_deprecated_original_scale(args: tuple, kwargs: Dict[str, Any]) -> None:
+    """
+    Reject the deprecated ``original_scale`` prediction argument.
+
+    :param args: Positional arguments passed after ``get_cov``.
+    :param kwargs: Keyword arguments passed to a prediction method.
+    :raises TypeError: If callers use the removed ``original_scale`` argument.
+    """
     if args or "original_scale" in kwargs:
         raise TypeError(DEPRECATED_ORIGINAL_SCALE_ERROR)
 
@@ -20,6 +27,11 @@ def reject_deprecated_original_scale(args: tuple, kwargs: Dict[str, Any]) -> Non
 class InputScaler:
     """
     Min/max input scaler with optional unscaled fidelity indices.
+
+    :param bounds: Tensor-like array with shape ``2 x input_dim`` in original input units.
+    :param multi_fidelity: If ``True``, keep fidelity indices discrete during scaling.
+    :param fidelity_dim: Dimension containing fidelity indices; defaults to the last column.
+    :param eps: Minimum allowed range before falling back to unit scale.
     """
 
     def __init__(
@@ -42,6 +54,12 @@ class InputScaler:
         self.x_range = torch.where(x_range.abs() >= self.eps, x_range, torch.ones_like(x_range))
 
     def to(self, device: torch.device) -> "InputScaler":
+        """
+        Move scaler tensors to a device.
+
+        :param device: Target PyTorch device.
+        :returns: This scaler, after moving stored tensors.
+        """
         self.bounds = self.bounds.to(device)
         self.x_min = self.x_min.to(device)
         self.x_max = self.x_max.to(device)
@@ -49,6 +67,13 @@ class InputScaler:
         return self
 
     def transform(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Scale inputs from original units to model units.
+
+        :param X: Tensor-like inputs whose last dimension matches ``input_dim``.
+        :returns: Scaled inputs with the same shape as ``X``; fidelity indices are rounded when ``multi_fidelity=True``.
+        :raises ValueError: If the last dimension of ``X`` does not match the scaler bounds.
+        """
         X = torch.as_tensor(X).float()
         self._validate_input_dim(X)
         x_min, x_range = self._scaling_tensors(X)
@@ -59,6 +84,13 @@ class InputScaler:
         return X_scaled
 
     def inverse_transform(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Transform model-unit inputs back to original units.
+
+        :param X: Tensor-like inputs whose last dimension matches ``input_dim``.
+        :returns: Inputs in original units with the same shape as ``X``; fidelity indices are rounded when ``multi_fidelity=True``.
+        :raises ValueError: If the last dimension of ``X`` does not match the scaler bounds.
+        """
         X = torch.as_tensor(X).float()
         self._validate_input_dim(X)
         x_min, x_range = self._scaling_tensors(X)
@@ -69,6 +101,11 @@ class InputScaler:
         return X_original
 
     def state_dict(self) -> Dict[str, Any]:
+        """
+        Return serializable input-scaler state for checkpoints.
+
+        :returns: Dictionary containing bounds, fidelity settings, and cached scaling tensors.
+        """
         return {
             "bounds": self.bounds,
             "multi_fidelity": self.multi_fidelity,
@@ -81,6 +118,13 @@ class InputScaler:
 
     @classmethod
     def from_state_dict(cls, state: Dict[str, Any], device: Optional[torch.device] = None) -> "InputScaler":
+        """
+        Reconstruct an input scaler from checkpoint state.
+
+        :param state: State produced by ``state_dict``.
+        :param device: Optional target device for restored tensors.
+        :returns: A reconstructed ``InputScaler``.
+        """
         scaler = cls(
             bounds=state["bounds"],
             multi_fidelity=state.get("multi_fidelity", False),

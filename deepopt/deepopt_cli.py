@@ -278,8 +278,8 @@ def learn(
     "--acq-method",
     help="""
               \b
-              The acquisiton function.
-              [NOTE: Some acquistion functions only work with a specific fidelity.]
+              The acquisition function.
+              [NOTE: Some acquisition functions only work with a specific fidelity.]
               \b
               Single    - [KG|MaxValEntropy|EI|NEI]
               Multi     - [KG|MaxValEntropy]
@@ -371,7 +371,7 @@ def learn(
 )
 @click.option(
     "--X-stddev",
-    help="Uncertainity in X (stddev) in each dimension. [example: --X-stddev [0.00005]].",
+    help="Uncertainty in X (stddev) in each dimension. [example: --X-stddev [0.00005]].",
     type=click.STRING,
     cls=ConditionalOption,
     depends_on="risk_measure",
@@ -414,10 +414,15 @@ def optimize(
     integer_fidelities,
 ) -> None:
     """
-    Load in the model created by `learn` and use it to propose new simulation points.
-    """    
+    Load in the model created by ``learn`` and use it to propose new simulation points.
+
+    Self-describing checkpoints provide their own training data, bounds, model type,
+    and config settings. Legacy checkpoints still require JSON-encoded ``--bounds``
+    and the original ``--infile``.
+    """
     checkpoint_metadata = get_checkpoint_metadata(learner_file)
     if checkpoint_metadata is None:
+        # Legacy checkpoints do not include the data and bounds needed to rebuild a wrapper.
         if infile is None:
             raise click.UsageError("Legacy checkpoints require --infile.")
         if bounds is None:

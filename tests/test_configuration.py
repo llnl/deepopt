@@ -118,3 +118,10 @@ def test_nnensemble_default_keys_regression():
     assert NNENSEMBLE_CONFIG["ff"] is True
     assert NNENSEMBLE_CONFIG["droupout_prob"] == 0.2
     assert "dropout_prob" not in NNENSEMBLE_CONFIG
+
+
+def test_nnensemble_config_exposes_dropout_prob_compatibility_key():
+    settings = ConfigSettings("nnEnsemble")
+
+    assert settings.get_setting("droupout_prob") == 0.2
+    assert settings.get_setting("dropout_prob") == 0.2

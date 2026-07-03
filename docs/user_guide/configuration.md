@@ -23,11 +23,11 @@ There are several configuration options for nnEnsemble and delUQ models that can
 | dropout_prob     | When using `dropout`, this sets the probability of dropping a neuron.        | 0.2       |
 | activation_first | When `dropout` is `True`, this sets whether neurons are dropped before or after applying the activation function (it has no effect of `dropout` is `False`). If `True`, the activation function is applied first followed by batchnorm (if `batchnorm` is `True`) and dropout regularization. Otherwise, the dropout regularization is performed first followed by the activation function and batchnorm (if `batchnorm` is `True`) regularization.        | True      |
 | learning_rate    | The learning rate to use in the optimizer. This is optimized during hyperparameter tuning, so it is not necessary to set precisely.        | 0.001     |
-| n_epochs         | The number of epochs to train for. We recommend keeping a large number (>=1000) when using smaller datasets.        | 1000      |
-| batch_size       | The batch size to use during training. If larger than dataset size, the entire dataset will be used as a single batch during each epoch of training.        | 1000      |
+| n_epochs         | The number of epochs to train for. We recommend keeping a large number (>=1000) when using smaller datasets.        | delUQ: 1000; nnEnsemble: 300      |
+| batch_size       | The batch size to use during training. If larger than dataset size, the entire dataset will be used as a single batch during each epoch of training.        | delUQ: 1000; nnEnsemble: 128      |
 | dist             | The initial distribution of Fourier frequencies. Choices are "uniform", "gaussian", and "laplace".        | uniform   |
 | opt_type         | Optimizer to use. Choices are "Adam" for the Adam optimizer and "SGD" for stochastic gradient descent.        | Adam      |
-| variance         | The scale of the frequency distribution ("dist") when using Fourier features. A "uniform" distribution is constant between +/- scale, a "gaussian" uses scale as the standard deviation, and the "laplace" distribution uses scale as the exponential decay factor.</br></br> This parameter is optimized during hyperparameter tuning, so it is not necessary to set precisely.        | 0.0015625 |
+| variance         | The scale of the frequency distribution ("dist") when using Fourier features. A "uniform" distribution is constant between +/- scale, a "gaussian" uses scale as the standard deviation, and the "laplace" distribution uses scale as the exponential decay factor.</br></br> This parameter is optimized during hyperparameter tuning, so it is not necessary to set precisely.        | 0.001 |
 | batchnorm        | Whether to use batchnorm regularization (True) or not (False)        | False     |
 | weight_decay     | Strength of weight decay (L2 penalty) to use during optimization        | 0     |
 
@@ -41,6 +41,23 @@ optimization:
   batch_limit_high: 24
   torch_num_threads: auto
 ```
+
+For optimize-only overrides, place just the candidate-generation settings in a config file:
+
+```yaml title="optimize.yaml"
+optimization:
+  profile: fast
+  batch_limit_high: 6
+  torch_num_threads: 4
+```
+
+Then pass it when proposing candidates from a self-describing checkpoint:
+
+```bash
+deepopt optimize -l learner_GP.ckpt -o suggested_inputs.npy -a EI -c optimize.yaml
+```
+
+For self-describing checkpoints, `-c/--config-file` can override the `optimization:` section used for candidate generation without restating the original training data, bounds, or model type.
 
 Profiles provide sensible defaults:
 

@@ -16,9 +16,9 @@ DeepOpt is a simple and easy-to-use library for performing Bayesian optimization
 
 The DeepOpt library comes equipped with two cornerstone commands:
 
-1. **Learn:** The `learn` command trains a machine learning model on a given set of data. Users can select between a neural network or Gaussian process (GP) model, with support for additional models in the future. Uncertainty quantification (UQ) is available in all models (neural nets currently use the delta-UQ method), allowing for direct use in a Bayesian optmization workflow. The `learn` command supports multi-fidelity modeling with an arbitrary number of fidelities.
+1. **Learn:** The `learn` command trains a machine learning model on a given set of data. Users can select a Gaussian process (`GP`), delta-UQ neural network (`delUQ`), or neural-network ensemble (`nnEnsemble`) surrogate. Uncertainty quantification (UQ) is available in all models, allowing for direct use in a Bayesian optimization workflow. The `learn` command supports multi-fidelity modeling with an arbitrary number of fidelities.
 
-2. **Optimize:**  The `optimize` command takes the previously trained model created through the `learn` command and runs a single Bayesian optimization step, proposing a set of candidate points aimed at improving the value of the objective function (output of the learned model). The user can choose between several available acquisition methods for selecting the candidate points. Support for optimization under input uncertainty and risk is available.
+2. **Optimize:**  The `optimize` command takes the previously trained model created through the `learn` command and runs a single Bayesian optimization step, proposing a set of candidate points aimed at improving the value of the objective function (output of the learned model). The user can choose between several available acquisition methods for selecting the candidate points. Support for optimization under input uncertainty and risk is available. Modern checkpoints are self-describing, so they can be reloaded and optimized without restating the original training data and bounds.
 
 ## Why DeepOpt?
 

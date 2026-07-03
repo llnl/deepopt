@@ -29,9 +29,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class DeltaEnc(Model):
     """
-    The `DeltaEnc` class represents the single-fidelity Delta UQ model for neural
-    networks. This model will allow us to set the training data, fit it, and get
-    our prediciton values with uncertainty.
+    BoTorch-compatible delta-UQ neural-network model.
+
+    The model stores training inputs in model units and can return predictions in
+    either model units or original output units through ``get_prediction_with_uncertainty``.
+    Checkpoints store network weights, Fourier-feature matrices, optimizer state,
+    output scaler state, optional input scaler state, and optional DeepOpt metadata.
     """
 
     def __init__(
@@ -123,17 +126,19 @@ class DeltaEnc(Model):
 
     @property
     def batch_shape(self):
+        """Batch shape inferred from the training inputs before ``n x d`` dimensions."""
         return self._batch_shape
 
     @batch_shape.setter
     def batch_shape(self, value):
+        """Set the batch shape used when expanding query tensors."""
         self._batch_shape = value
 
     @property
     def num_outputs(self):
         return self.output_dim
 
-    # coped from model.py
+    # copied from model.py
     # Originally, this method accessed the first dim of self.train_inputs (i.e self.train_inputs[0])
     # because the inputs are assumed to be in batches.
     def _set_transformed_inputs(self) -> None:
@@ -239,10 +244,11 @@ class DeltaEnc(Model):
 
     def save_ckpt(self, path: str, name: str, checkpoint_metadata: Dict[str, Any] = None):
         """
-        Save a trained model to a checkpoint file
+        Save a trained model to a checkpoint file.
 
-        :param path: The path to the checkpoint file
-        :param name: The name of the checkpoint file
+        :param path: The directory where the checkpoint will be written.
+        :param name: The checkpoint base name, without the ``.ckpt`` suffix.
+        :param checkpoint_metadata: Optional self-describing DeepOpt metadata saved under ``deepopt_checkpoint``.
         """
         state = {"epoch": self.n_epochs}
         state["state_dict"] = self.f_predictor.state_dict()
@@ -259,10 +265,10 @@ class DeltaEnc(Model):
 
     def load_ckpt(self, path: str, name: str):
         """
-        Load in a trained model from a checkpoint file
+        Load a trained model from a checkpoint file.
 
-        :param path: The path to the checkpoint file
-        :param name: The name of the checkpoint file
+        :param path: The directory containing the checkpoint.
+        :param name: The checkpoint base name, without the ``.ckpt`` suffix.
         """
         saved_state = torch.load(os.path.join(path, name + ".ckpt"), map_location=self.device)
         if "input_scaler" in saved_state:
@@ -334,7 +340,7 @@ class DeltaEnc(Model):
         :returns: A GPyTorchPosterior object with information on the posterior we calculated
         """
         # Transformations are applied at evaluation time.
-        # An acquisiton's objective funtion will call
+        # An acquisition's objective function will call
         # the model's posterior.
         X = self.transform_inputs(X)
         mvn = self.forward(X, **kwargs)
@@ -411,15 +417,13 @@ class DeltaEnc(Model):
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Given a tensor calculate the prediction with uncertainty.
+        Evaluate delta-UQ mean and uncertainty at query points.
 
-        :param q: A tensor with data we'll calculate prediction with uncertainty for
-        :param get_cov: If True, get the covariance. Otherwise, get the variance.
-        :param original_scale_x: If True, transform query inputs from original units to model units.
-        :param original_scale_y: If True, transform predictions back to original output units.
-
-        :returns: A tuple containing the mean tensor and the variance (or covariance if
-            `get_cov=True`) tensor
+        :param q: Query tensor with shape ``... x q x d``.
+        :param get_cov: If ``True``, return the joint ``q x q`` covariance; otherwise return pointwise variance.
+        :param original_scale_x: If ``True``, transform query inputs from original units to model units.
+        :param original_scale_y: If ``True``, transform predictions back to original output units.
+        :returns: ``(mean, variance)`` or ``(mean, covariance)`` depending on ``get_cov``.
         """
         reject_deprecated_original_scale(args, kwargs)
         if original_scale_x:

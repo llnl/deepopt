@@ -9,6 +9,10 @@ import torch
 class StandardizeOutputScaler:
     """
     Legacy z-score output scaler for old BoTorch Standardize checkpoints.
+
+    :param mean: Stored outcome mean from a legacy checkpoint.
+    :param std: Stored outcome standard deviation from a legacy checkpoint.
+    :param eps: Minimum standard deviation before falling back to one.
     """
 
     def __init__(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-12) -> None:
@@ -104,6 +108,11 @@ class OutputScaler:
     def fit(self, Y: torch.Tensor, X: Optional[torch.Tensor] = None) -> "OutputScaler":
         """
         Fit scaling constants from output data.
+
+        :param Y: Output tensor with observations along the second-to-last dimension.
+        :param X: Input tensor used to select fidelity-specific scales when ``multi_fidelity=True``.
+        :returns: This scaler after fitting ``y_min``, ``y_max``, and ``y_range``.
+        :raises ValueError: If per-fidelity scaling is enabled and ``X`` is not provided.
         """
         Y = Y.float()
         if self.multi_fidelity:
@@ -144,6 +153,10 @@ class OutputScaler:
     def transform(self, Y: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Scale outputs to model-native units.
+
+        :param Y: Output means or samples in original output units.
+        :param X: Input tensor used to select per-fidelity scales when needed.
+        :returns: Output tensor in scaled model units with the same shape as ``Y``.
         """
         y_min, y_range = self._scaling_tensors(Y, X)
         return (Y - y_min) / y_range
@@ -151,6 +164,10 @@ class OutputScaler:
     def inverse_transform(self, Y: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Transform scaled means or samples back to original output units.
+
+        :param Y: Output means or samples in model units.
+        :param X: Input tensor used to select per-fidelity scales when needed.
+        :returns: Output tensor in original units with the same shape as ``Y``.
         """
         y_min, y_range = self._scaling_tensors(Y, X)
         return Y * y_range + y_min
@@ -158,13 +175,21 @@ class OutputScaler:
     def inverse_variance(self, Yvar: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Transform scaled variances back to original output units.
+
+        :param Yvar: Variance tensor in squared model units.
+        :param X: Input tensor used to select per-fidelity scales when needed.
+        :returns: Variance tensor in squared original output units.
         """
         _, y_range = self._scaling_tensors(Yvar, X)
         return Yvar * y_range.pow(2)
 
     def inverse_covariance(self, covariance: torch.Tensor, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Transform a q x q covariance matrix back to original output units.
+        Transform a covariance matrix back to original output units.
+
+        :param covariance: Covariance tensor in squared model units, with ``q x q`` covariance dimensions at the end.
+        :param X: Input tensor used to select per-fidelity scales when needed.
+        :returns: Covariance tensor in squared original output units.
         """
         if self.multi_fidelity:
             if X is None:
@@ -177,7 +202,9 @@ class OutputScaler:
 
     def state_dict(self) -> Dict[str, Any]:
         """
-        Return serializable scaler state.
+        Return serializable scaler state for checkpoints.
+
+        :returns: Dictionary containing fidelity settings and fitted scaling tensors.
         """
         return {
             "multi_fidelity": self.multi_fidelity,
@@ -193,6 +220,10 @@ class OutputScaler:
     def from_state_dict(cls, state: Dict[str, Any], device: Optional[torch.device] = None) -> "OutputScaler":
         """
         Reconstruct a scaler from serialized state.
+
+        :param state: State produced by ``state_dict``.
+        :param device: Optional target device for restored tensors.
+        :returns: A reconstructed ``OutputScaler``.
         """
         scaler = cls(
             multi_fidelity=state.get("multi_fidelity", False),

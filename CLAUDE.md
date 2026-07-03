@@ -106,8 +106,8 @@ Preserve these unless intentionally breaking compatibility:
 - Single-fidelity data are normalized using provided `bounds`.
 - Multi-fidelity mode treats the last input column as fidelity, rounds it after normalization, and sets `target_fidelities` to the highest fidelity index.
 - `Defaults` values are part of the public behavior and covered by tests.
-- `NNENSEMBLE_CONFIG` currently contains `droupout_prob` rather than `dropout_prob`; this is likely a typo but is now captured as current behavior.
-- NN checkpoint dictionaries contain keys like `epoch`, `state_dict`, `B`, and `opt_state_dict`.
+- `NNENSEMBLE_CONFIG` currently contains `droupout_prob` rather than `dropout_prob`; this historical spelling is captured as current behavior, and `ConfigSettings` maps it to `dropout_prob` for runtime use.
+- NN checkpoint dictionaries contain keys like `epoch`, `state_dict`, `B`, and `opt_state_dict`, plus scaler state and optional `deepopt_checkpoint` metadata in modern checkpoints.
 - Multi-fidelity candidate saving with `integer_fidelities=True` currently produces an object dtype array by concatenating float columns with an integer fidelity column.
 
 ## Development workflow guidance
@@ -135,13 +135,3 @@ Use these starting points instead of broad scanning:
 - MLP architecture/optimizers: `deepopt/surrogate_utils.py`, `tests/test_surrogate_utils.py`
 - Acquisition functions: `deepopt/acquisition.py`, `tests/test_acquisition.py`
 - User-facing docs examples: `docs/index.md`, `docs/user_guide/tutorial.md`, `docs/user_guide/configuration.md`, `docs/user_guide/acquisition_functions.md`
-
-## Known issue captured by tests
-
-`ConfigSettings.load_config()` currently does:
-
-```python
-config = json.loads(file)
-```
-
-for `.json` config files. That raises `TypeError` because `json.loads` expects a string/bytes, not a file object. The current tests record this behavior. If the intent is to support JSON config files, change implementation to `json.load(file)` or `json.loads(file.read())`, then update `tests/test_configuration.py` accordingly.

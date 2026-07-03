@@ -43,6 +43,7 @@ NNENSEMBLE_CONFIG = {"n_estimators": 100,
 
 GP_CONFIG = {}
 
+# Acquisition optimization profiles used by ConfigSettings['optimization'].
 OPTIMIZATION_PROFILES = {
     "balanced": {
         "num_restarts_high": 15,

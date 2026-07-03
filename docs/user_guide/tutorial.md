@@ -68,28 +68,27 @@ Training and optimizing are done as in [Getting Started](../index.md#getting-sta
 
 === "DeepOpt CLI"
     ```bash
-    input_dim = 5
-    bounds = ""
-    for i in {1..input_dim-1}; do bounds+="[0,1],"; done
-    bounds+="[0,1]" #(1)
+    bounds="[[0,1],[0,1],[0,1],[0,1],[0,1]]" #(1)
     deepopt learn -i sims.npz -o learner_nnEnsemble.ckpt -m nnEnsemble -b $bounds
     ```
 
-    1. Together with the previous 2 lines, this defines the appropriate `bounds` variable to match `input_dim`.
+    1. This defines the appropriate JSON-encoded `bounds` variable to match `input_dim`.
 
-The checkpoint files saved by DeepOpt use `torch.save` under the hood. They are python dictionaries and can be viewed using `torch.load`:
+The checkpoint files saved by DeepOpt use `torch.save` under the hood. They are Python dictionaries and can be viewed using `torch.load`:
 ```py title="view_ckpt.py" linenums="1"
 import torch
-model_type = 'nnEnsemble'
-ckpt = torch.load(f'learner_{model_type}.ckpt')
-print(ckpt.keys())
-```
-The nnEnsemble model has 4 entries in the checkpoint dictionary:
+from deepopt.models import get_checkpoint_metadata, is_self_describing_checkpoint, load_deepopt_wrapper
 
-- `epoch`: is the number of epochs each NN in the ensemble was trained for 
-- `state_dict`: is a list of dictionaries, each containing all of the values of the NN weights, biases, and other layer parameters for the respective NN in the ensemble
-- `B`: is the list of initial transformations to frequency space for each NN in the ensemble when using Fourier features 
-- `opt_state_dict`: is a list containing the optimizer parameters for each NN in the ensemble
+model_type = 'nnEnsemble'
+learner_file = f'learner_{model_type}.ckpt'
+ckpt = torch.load(learner_file)
+print(ckpt.keys())
+print(is_self_describing_checkpoint(learner_file))
+print(get_checkpoint_metadata(learner_file).keys())
+model = load_deepopt_wrapper(learner_file)
+```
+
+Modern checkpoints may include model-specific state such as `epoch`, `state_dict`, `B`, and `opt_state_dict`, plus scaler state (`output_scaler` and optionally `input_scaler`). Checkpoints saved by current DeepOpt wrappers also include a `deepopt_checkpoint` metadata entry with the model type, training data, bounds, and configuration settings needed to reload the wrapper.
 
 Now that we saved the trained model, we can use it to propose new candidate points:
 
@@ -104,9 +103,10 @@ Now that we saved the trained model, we can use it to propose new candidate poin
 
 === "DeepOpt CLI"
     ```bash
-    deepopt optimize -i sims.npz -o suggested_inputs.npy -l learner_nnEnsemble.ckpt \
-    -m nnEnsemble -b $bounds -a EI
+    deepopt optimize -o suggested_inputs.npy -l learner_nnEnsemble.ckpt -a EI
     ```
+
+    Current DeepOpt checkpoints are self-describing, so `optimize` can reload the training data, bounds, model type, and configuration from `learner_nnEnsemble.ckpt`. Legacy checkpoints without `deepopt_checkpoint` metadata still require `--infile`, `--bounds`, and `--model-type`.
 
 If you're using the DeepOpt API, we can now run our script with:
 
@@ -120,17 +120,17 @@ python -c "import numpy as np; print(np.load('suggested_inputs.npy'))"
 ```
 
 ### Changing the neural network configuration
-Simply create a configuration yaml file with the desired entries (available settings described [here](configuration.md)). Then train and optimize the model as above, while specifying the configuration file:
+Simply create a configuration yaml file with the desired entries (available settings described [here](configuration.md)). Training settings are loaded when you construct the model configuration, and optimize-time settings can be provided through an `optimization:` section in the same file format.
 
 === "DeepOpt API"
     ```py title="run_deepopt.py" linenums="11"
-    model.learn(outfile=f'learner_{model_type}.ckpt',
-                config_file='config.yaml') #(1)
+    cs = ConfigSettings(model_type=model_type, config_file='config.yaml')
+    model = model_class(data_file='sims.npz', bounds=bounds, config_settings=cs)
+    model.learn(outfile=f'learner_{model_type}.ckpt') #(1)
 
     model.optimize(outfile='suggested_inputs.npy',
                    learner_file=f'learner_{model_type}.ckpt',
-                   config_file='config.yaml',
-                   acq_method='EI') #(2)    
+                   acq_method='EI') #(2)
     ```
 
     1. Train the neural network ensemble and save its state to a checkpoint file.
@@ -138,19 +138,15 @@ Simply create a configuration yaml file with the desired entries (available sett
 
 === "DeepOpt CLI"
     ```bash
-    input_dim = 5
-    bounds = ""
-    for i in {1..input_dim-1}; do bounds+="[0,1],"; done
-    bounds+="[0,1]" #(1)
+    bounds="[[0,1],[0,1],[0,1],[0,1],[0,1]]" #(1)
     deepopt learn -i sims.npz -o learner_nnEnsemble.ckpt -m nnEnsemble -b $bounds -c config.yaml #(2)
 
-    deepopt optimize -i sims.npz -o suggested_inputs.npy -l learner_nnEnsemble.ckpt \
-    -m nnEnsemble -b $bounds -a EI -c config.yaml #(3)
+    deepopt optimize -o suggested_inputs.npy -l learner_nnEnsemble.ckpt -a EI -c config.yaml #(3)
     ```
 
-    1. Together with the 2 previous lines, this defines the appropriate `bounds` variable to match `input_dim`.
+    1. This defines the appropriate JSON-encoded `bounds` variable to match `input_dim`.
     2. Train the neural network ensemble and save its state to a checkpoint file.
-    3. Use [Expected Improvement](./acquisition_functions.md#ei) to acquire new points based on the model saved in `learner_nnEnsemble.ckpt` and save those points as a `numpy` array in `suggested_inputs.npy`.
+    3. Use [Expected Improvement](./acquisition_functions.md#ei) with optimize-time settings from `config.yaml`. With self-describing checkpoints, `optimize` does not need `--infile`, `--bounds`, or `--model-type`.
 
 
 ## Tutorial: Iterative optimization
@@ -325,9 +321,8 @@ Below, we show how to modify the `optimize` call from `run_deepopt.py` to accomm
 
 === "DeepOpt CLI"
     ```bash
-    deepopt optimize -i sims.npz -l learner_GP.ckpt -o suggested_inputs.npy \
-    -b "[[0, 1], [0, 1], [0, 1], [0, 1], [0, 1]]" \
-    -a KG --multi-fidelity --fidelity-cost "[1,6]" #(1)
+    deepopt optimize -l learner_GP.ckpt -o suggested_inputs.npy \
+    -a KG --fidelity-cost "[1,6]" #(1)
     ```
 
     1. We use the [Knowledge Gradient (KG)](./acquisition_functions.md#kg) multi-fidelity acquisition function with a 1:6 ratio of low:high fidelity costs.
@@ -453,9 +448,9 @@ The plot shows a running max in orange that converges to the objective maximum (
 
     Currently only [EI](./acquisition_functions.md#ei), [NEI](./acquisition_functions.md#nei), and [KG](./acquisition_functions.md#kg) [acquisition functions](./acquisition_functions.md) support risk measures.
 
-To do risk-averse optimization, simply specify the `risk_measure` (CLI: `--risk-measure`), `risk_level` (CLI: `--risk-level`), `risk_n_deltas` (CLI: `--risk_n_deltas`), and `x_stddev` (CLI: `--X-stddev`) when calling `optimize`.
+To do risk-averse optimization, simply specify the `risk_measure` (CLI: `--risk-measure`), `risk_level` (CLI: `--risk-level`), `risk_n_deltas` (CLI: `--risk-n-deltas`), and `x_stddev` (CLI: `--X-stddev`) when calling `optimize`.
 
-The available risk measures are VaR (variance at risk) and CVaR (conditional variance at resk). The risk level is between 0 and 1 and sets the corresponding alpha value (see the BoTorch [example](https://botorch.org/tutorials/risk_averse_bo_with_environmental_variables) for more details). 
+The available risk measures are VaR (Value-at-Risk) and CVaR (Conditional Value-at-Risk). The risk level is between 0 and 1 and sets the corresponding alpha value (see the BoTorch [example](https://botorch.org/tutorials/risk_averse_bo_with_environmental_variables) for more details). `MaxValEntropy` does not currently support risk measures.
 
 `risk_n_deltas` sets the number of samples to draw for input perturbations (more accuracy and longer run time for larger values). 
 
