@@ -7,6 +7,7 @@ pytest.importorskip("gpytorch")
 pytest.importorskip("ray")
 
 from deepopt.configuration import ConfigSettings
+from deepopt.parallel_acq import select_best, split_list_by_workers, split_tensor_by_workers
 from deepopt.models import (
     DEEPOPT_CHECKPOINT_KEY,
     AcquisitionOptimizationSettings,
@@ -413,6 +414,113 @@ def test_multi_fidelity_candidate_generation_uses_resolved_optimization_settings
     assert captured["num_restarts"] == 10
     assert captured["raw_samples"] == 34
     assert captured["options"] == {"batch_limit": 6, "maxiter": 21, "seed": wrapper.random_seed}
+
+
+def test_parallel_single_fidelity_candidate_generation_forwards_optimization_kwargs(
+    monkeypatch, single_fidelity_data_file
+):
+    settings = ConfigSettings("GP")
+    settings.set_setting(
+        "optimization",
+        {
+            "profile": "fast",
+            "num_restarts_high": 9,
+            "raw_samples_high": 33,
+            "batch_limit_high": 7,
+            "maxiter": 22,
+        },
+    )
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(single_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        device="cpu",
+    )
+    captured = {}
+
+    monkeypatch.setattr("deepopt.models.qExpectedImprovement", lambda *args, **kwargs: object())
+
+    def fake_parallel_optimize_acqf(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.parallel_optimize_acqf", fake_parallel_optimize_acqf)
+
+    wrapper._get_candidates_sf(model=object(), acq_method="EI", q=1, parallel_acq={"enabled": True, "num_workers": 2})
+
+    assert captured["settings"].enabled is True
+    assert captured["settings"].num_workers == 2
+    assert captured["num_restarts"] == 9
+    assert captured["raw_samples"] == 33
+    assert captured["options"] == {"batch_limit": 7, "maxiter": 22, "seed": wrapper.random_seed}
+
+
+def test_parallel_multi_fidelity_candidate_generation_forwards_optimization_kwargs(
+    monkeypatch, multi_fidelity_data_file
+):
+    settings = ConfigSettings("GP")
+    settings.set_setting(
+        "optimization",
+        {
+            "profile": "fast",
+            "num_restarts_high": 10,
+            "raw_samples_high": 34,
+            "batch_limit_high": 6,
+            "maxiter": 21,
+            "n_fantasies": 5,
+        },
+    )
+    bounds = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    wrapper = GPModel(
+        data_file=str(multi_fidelity_data_file),
+        bounds=bounds,
+        config_settings=settings,
+        multi_fidelity=True,
+        device="cpu",
+    )
+    captured = {}
+
+    def fake_mf_mes(*args, **kwargs):
+        captured["n_fantasies"] = kwargs["num_fantasies"]
+        return object()
+
+    def fake_parallel_optimize_acqf_mixed(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2, 1.0]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.qMultiFidelityMaxValueEntropy", fake_mf_mes)
+    monkeypatch.setattr("deepopt.models.parallel_optimize_acqf_mixed", fake_parallel_optimize_acqf_mixed)
+
+    wrapper._get_candidates_mf(
+        model=object(),
+        acq_method="MaxValEntropy",
+        q=1,
+        fidelity_cost=np.array([1.0, 3.0], dtype=np.float32),
+        parallel_acq={"enabled": True, "num_workers": 2},
+    )
+
+    assert captured["settings"].enabled is True
+    assert captured["n_fantasies"] == 5
+    assert captured["fixed_features_list"] == [{2: 0}, {2: 1}]
+    assert captured["num_restarts"] == 10
+    assert captured["raw_samples"] == 34
+    assert captured["options"] == {"batch_limit": 6, "maxiter": 21, "seed": wrapper.random_seed}
+
+
+def test_parallel_acq_split_and_select_helpers():
+    tensor = torch.arange(15).reshape(5, 3)
+    chunks = split_tensor_by_workers(tensor, 2)
+    assert [chunk.shape[0] for chunk in chunks] == [3, 2]
+
+    list_chunks = split_list_by_workers([{0: i} for i in range(5)], 2)
+    assert [len(chunk) for chunk in list_chunks] == [3, 2]
+
+    candidates = torch.tensor([[0.1], [0.9], [0.3]])
+    values = torch.tensor([1.0, 5.0, 2.0])
+    best_candidate, best_value = select_best(candidates, values)
+    torch.testing.assert_close(best_candidate, torch.tensor([0.9]))
+    torch.testing.assert_close(best_value, torch.tensor(5.0))
 
 
 def test_fidelity_cost_model_uses_rounded_last_column():

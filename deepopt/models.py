@@ -46,6 +46,7 @@ from deepopt.deltaenc import DeltaEnc
 from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.nn_ensemble import NNEnsemble
 from deepopt.output_scaling import OutputScaler, StandardizeOutputScaler
+from deepopt.parallel_acq import ParallelAcqSettings, parallel_optimize_acqf, parallel_optimize_acqf_mixed, resolve_parallel_acq_settings
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
@@ -705,6 +706,26 @@ class DeepoptBaseModel(ABC):
     def _make_acq_options(self, batch_limit: int, maxiter: int) -> Dict[str, int]:
         return {"batch_limit": batch_limit, "maxiter": maxiter, "seed": self.random_seed}
 
+    def _optimize_acqf(
+        self,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        parallel_settings = resolve_parallel_acq_settings(parallel_acq)
+        if parallel_settings.enabled:
+            return parallel_optimize_acqf(settings=parallel_settings, **kwargs)
+        return optimize_acqf(**kwargs)
+
+    def _optimize_acqf_mixed(
+        self,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        parallel_settings = resolve_parallel_acq_settings(parallel_acq)
+        if parallel_settings.enabled:
+            return parallel_optimize_acqf_mixed(settings=parallel_settings, **kwargs)
+        return optimize_acqf_mixed(**kwargs)
+
     def _get_candidates_mf(
         self,
         model: Type[Model],
@@ -715,6 +736,7 @@ class DeepoptBaseModel(ABC):
         risk_n_deltas: Optional[int] = None,
         optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get the candidates for a multi-fidelity run.
@@ -760,7 +782,8 @@ class DeepoptBaseModel(ABC):
                 values=[self.num_fidelities - 1],
             )
 
-            best_candidate, max_pmean = optimize_acqf(
+            best_candidate, max_pmean = self._optimize_acqf(
+                parallel_acq=parallel_acq,
                 acq_function=curr_val_acqf,
                 bounds=bounds[:, :-1],
                 q=1,
@@ -800,8 +823,9 @@ class DeepoptBaseModel(ABC):
                     candidate_set=candidate_set,
                     seed=self.random_seed,
                 )
-            candidates, acq_value = optimize_acqf_mixed(
-                q_acq,
+            candidates, acq_value = self._optimize_acqf_mixed(
+                parallel_acq=parallel_acq,
+                acq_function=q_acq,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
@@ -821,7 +845,8 @@ class DeepoptBaseModel(ABC):
                     values=[self.num_fidelities - 1],
                 )
 
-                _, max_pmean = optimize_acqf(
+                _, max_pmean = self._optimize_acqf(
+                    parallel_acq=parallel_acq,
                     acq_function=curr_val_acqf,
                     bounds=bounds[:, :-1],
                     q=1,
@@ -841,7 +866,8 @@ class DeepoptBaseModel(ABC):
                 project=self._project,
                 objective=risk_objective,
             )
-            candidates, acq_value = optimize_acqf_mixed(
+            candidates, acq_value = self._optimize_acqf_mixed(
+                parallel_acq=parallel_acq,
                 acq_function=mfkg_acqf,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
@@ -866,6 +892,7 @@ class DeepoptBaseModel(ABC):
         risk_n_deltas: Optional[int] = None,
         optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
     ) -> Tuple[Any, Any]:
         """
         Get the candidates for a single-fidelity run.
@@ -895,7 +922,8 @@ class DeepoptBaseModel(ABC):
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
 
         if propose_best:
-            best_candidate, max_pmean = optimize_acqf(
+            best_candidate, max_pmean = self._optimize_acqf(
+                parallel_acq=parallel_acq,
                 acq_function=PosteriorMean(
                     model,
                     posterior_transform=ExpectationPosteriorTransform(n_w=risk_n_deltas) if risk_objective else None,
@@ -931,7 +959,8 @@ class DeepoptBaseModel(ABC):
             )
         elif acq_method == "KG":
             if not propose_best:
-                _, max_pmean = optimize_acqf(
+                _, max_pmean = self._optimize_acqf(
+                    parallel_acq=parallel_acq,
                     acq_function=PosteriorMean(
                         model,
                         posterior_transform=ExpectationPosteriorTransform(n_w=risk_n_deltas) if risk_objective else None,
@@ -951,8 +980,9 @@ class DeepoptBaseModel(ABC):
                 current_value=max_pmean,
                 objective=risk_objective,
             )
-        candidates, acq_value = optimize_acqf(
-            q_acq,
+        candidates, acq_value = self._optimize_acqf(
+            parallel_acq=parallel_acq,
+            acq_function=q_acq,
             bounds=bounds,
             q=q,
             num_restarts=settings.num_restarts_low if acq_method in ["MaxValEntropy", "KG"] else settings.num_restarts_high,
@@ -978,6 +1008,7 @@ class DeepoptBaseModel(ABC):
         fidelity_cost: Optional[np.ndarray] = None,
         optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
     ) -> Tuple[Any, Any]:
         """
         Get the candidates using the model loaded in with `load_model` and the acquisition method
@@ -1016,6 +1047,7 @@ class DeepoptBaseModel(ABC):
                 risk_n_deltas=risk_n_deltas,
                 optimization_settings=optimization_settings,
                 propose_best=propose_best,
+                parallel_acq=parallel_acq,
             )
         else:
             candidates, acq_value = self._get_candidates_sf(
@@ -1026,6 +1058,7 @@ class DeepoptBaseModel(ABC):
                 risk_n_deltas=risk_n_deltas,
                 optimization_settings=optimization_settings,
                 propose_best=propose_best,
+                parallel_acq=parallel_acq,
             )
         return candidates, acq_value
 
@@ -1043,6 +1076,7 @@ class DeepoptBaseModel(ABC):
         propose_best: bool = False,
         integer_fidelities: bool = False,
         optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
+        parallel_acq: Optional[Union[Dict[str, Any], ParallelAcqSettings]] = None,
     ) -> None:
         """
         The function to process the `deepopt optimize` command.
@@ -1112,6 +1146,7 @@ class DeepoptBaseModel(ABC):
             fidelity_cost=fidelity_cost,
             optimization_settings=optimization_settings,
             propose_best=propose_best,
+            parallel_acq=parallel_acq,
         )
         if self.multi_fidelity:
             candidates[:, :-1] = candidates[:, :-1] * (self.bounds[1, :-1] - self.bounds[0, :-1]) + self.bounds[0, :-1]
