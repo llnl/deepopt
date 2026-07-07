@@ -4,6 +4,7 @@ from benchmarks.benchmark_parallel_acq import (
     configure_parent_torch_threads,
     parallel_settings,
     parse_args,
+    restore_parent_autograd_multithreading,
     run_once,
     worker_torch_num_interop_threads_for_workers,
     worker_torch_num_threads_for_workers,
@@ -24,8 +25,27 @@ def test_parallel_settings_uses_default_thread_budget():
         settings = parallel_settings("cpu-parallel", workers, args)
 
         assert settings["num_workers"] == workers
+        assert settings["start_method"] == "spawn"
         assert settings["worker_torch_num_threads"] * workers == 64
         assert settings["worker_torch_num_interop_threads"] * workers == 64
+
+
+def test_parallel_from_checkpoint_uses_fork_for_unpicklable_acquisitions():
+    args = parse_args(["--learner-file", "model.pt"])
+
+    assert parallel_settings("cpu-parallel-from-checkpoint", 2, args)["start_method"] == "fork"
+
+
+def test_explicit_start_method_override_is_preserved():
+    args = parse_args(["--learner-file", "model.pt", "--start-method", "fork"])
+
+    assert parallel_settings("cpu-parallel", 2, args)["start_method"] == "fork"
+
+
+def test_default_modes_only_run_spawn_safe_parallel_path():
+    args = parse_args(["--learner-file", "model.pt"])
+
+    assert args.modes == ["cpu-parallel"]
 
 
 def test_serial_mode_has_no_parallel_settings():
@@ -63,11 +83,20 @@ def test_parallel_mode_constrains_parent_torch_threads(monkeypatch):
     calls = []
 
     monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.is_multithreading_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.set_multithreading_enabled",
+        lambda value: calls.append(("autograd_threads", value)),
+    )
     monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_interop_threads", lambda value: calls.append(("interop", value)))
 
+    restore_parent_autograd_multithreading()
     configure_parent_torch_threads({"enabled": True})
 
-    assert calls == [("threads", 1), ("interop", 1)]
+    assert calls == [("threads", 1), ("autograd_threads", False), ("interop", 1)]
 
 
 def test_serial_mode_uses_configured_torch_threads(monkeypatch):
@@ -77,6 +106,26 @@ def test_serial_mode_uses_configured_torch_threads(monkeypatch):
     configure_parent_torch_threads(None, wrapper, "settings")
 
     assert calls == [("wrapper", "settings")]
+
+
+def test_serial_mode_restores_parent_autograd_multithreading_after_parallel(monkeypatch):
+    calls = []
+    wrapper = type("Wrapper", (), {"_configure_torch_threads": lambda self, settings: calls.append(("wrapper", settings))})()
+
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.is_multithreading_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.set_multithreading_enabled",
+        lambda value: calls.append(("autograd_threads", value)),
+    )
+
+    restore_parent_autograd_multithreading()
+    configure_parent_torch_threads({"enabled": True})
+    configure_parent_torch_threads(None, wrapper, "settings")
+
+    assert calls == [("autograd_threads", False), ("autograd_threads", True), ("wrapper", "settings")]
 
 
 def test_parallel_run_constrains_parent_before_loading_wrapper(monkeypatch):
@@ -127,6 +176,14 @@ def test_parallel_run_constrains_parent_before_loading_wrapper(monkeypatch):
             return FakeCandidates(), FakeValue()
 
     monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.is_multithreading_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "benchmarks.benchmark_parallel_acq.torch.autograd.set_multithreading_enabled",
+        lambda value: calls.append(("autograd_threads", value)),
+    )
     monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_interop_threads", lambda value: calls.append(("interop", value)))
     monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.is_tensor", lambda value: True)
 
@@ -138,5 +195,5 @@ def test_parallel_run_constrains_parent_before_loading_wrapper(monkeypatch):
 
     run_once(args, "cpu-parallel", 2)
 
-    assert calls[:3] == [("threads", 1), ("interop", 1), "load_wrapper"]
+    assert calls[:4] == [("threads", 1), ("autograd_threads", False), ("interop", 1), "load_wrapper"]
     assert ("wrapper_threads", settings) not in calls

@@ -66,6 +66,8 @@ def select_best(candidates: torch.Tensor, acq_values: torch.Tensor) -> Tuple[tor
 
 def _set_worker_torch_threads(settings: ParallelAcqSettings) -> None:
     torch.set_num_threads(settings.worker_torch_num_threads)
+    if settings.start_method == "fork":
+        torch.autograd.set_multithreading_enabled(False)
     if settings.worker_torch_num_interop_threads is not None:
         try:
             torch.set_num_interop_threads(settings.worker_torch_num_interop_threads)

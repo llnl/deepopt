@@ -10,6 +10,7 @@ from deepopt.configuration import ConfigSettings
 from deepopt.parallel_acq import (
     ParallelAcqSettings,
     _optimize_acqf_worker,
+    _set_worker_torch_threads,
     parallel_optimize_acqf,
     select_best,
     split_list_by_workers,
@@ -553,6 +554,18 @@ def test_parallel_acq_worker_accepts_legacy_payload(monkeypatch):
     torch.testing.assert_close(candidates, torch.tensor([[0.4]]))
     torch.testing.assert_close(acq_values, torch.tensor([2.0]))
     assert warning_messages == []
+
+
+def test_fork_worker_disables_autograd_multithreading(monkeypatch):
+    calls = []
+    settings = ParallelAcqSettings(start_method="fork", worker_torch_num_threads=3, worker_torch_num_interop_threads=None)
+
+    monkeypatch.setattr("deepopt.parallel_acq.torch.set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr("deepopt.parallel_acq.torch.autograd.set_multithreading_enabled", lambda value: calls.append(("autograd_threads", value)))
+
+    _set_worker_torch_threads(settings)
+
+    assert calls == [("threads", 3), ("autograd_threads", False)]
 
 
 def test_parallel_acq_fork_workers_share_unpicklable_acq_function(monkeypatch):

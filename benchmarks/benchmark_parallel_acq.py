@@ -19,6 +19,9 @@ from deepopt.deepopt_cli import get_deepopt_model
 from deepopt.models import get_checkpoint_metadata, load_deepopt_wrapper
 
 
+_PARENT_AUTOGRAD_MULTITHREADING_ENABLED: Optional[bool] = None
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--learner-file", required=True)
@@ -39,7 +42,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["cpu-parallel", "cpu-parallel-from-checkpoint"],
+        default=["cpu-parallel"],
         choices=["gpu-serial", "cpu-serial", "cpu-parallel", "cpu-parallel-from-checkpoint"],
     )
     parser.add_argument("--repeat", type=int, default=1)
@@ -47,6 +50,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--total-worker-torch-threads", type=int, default=64)
     parser.add_argument("--worker-torch-num-interop-threads", type=int)
     parser.add_argument("--total-worker-torch-num-interop-threads", type=int, default=64)
+    parser.add_argument("--start-method", choices=["auto", "spawn", "fork"], default="auto")
     return parser.parse_args(argv)
 
 
@@ -158,27 +162,48 @@ def worker_torch_num_interop_threads_for_workers(workers: int, args: argparse.Na
     )
 
 
+def start_method_for_mode(mode: str, args: argparse.Namespace) -> str:
+    if args.start_method != "auto":
+        return args.start_method
+    if mode == "cpu-parallel-from-checkpoint":
+        return "fork"
+    return "spawn"
+
+
 def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Optional[Dict[str, object]]:
     if "parallel" not in mode:
         return None
     return {
         "enabled": True,
         "num_workers": workers,
-        "start_method": "fork",
+        "start_method": start_method_for_mode(mode, args),
         "worker_torch_num_threads": worker_torch_num_threads_for_workers(workers, args),
         "worker_torch_num_interop_threads": worker_torch_num_interop_threads_for_workers(workers, args),
     }
 
 
+def restore_parent_autograd_multithreading() -> None:
+    global _PARENT_AUTOGRAD_MULTITHREADING_ENABLED
+    if _PARENT_AUTOGRAD_MULTITHREADING_ENABLED is None:
+        return
+    torch.autograd.set_multithreading_enabled(_PARENT_AUTOGRAD_MULTITHREADING_ENABLED)
+    _PARENT_AUTOGRAD_MULTITHREADING_ENABLED = None
+
+
 def configure_parent_torch_threads(
     parallel_acq_settings: Optional[Dict[str, object]], wrapper=None, optimization_settings=None
 ) -> None:
+    global _PARENT_AUTOGRAD_MULTITHREADING_ENABLED
     if parallel_acq_settings is None:
+        restore_parent_autograd_multithreading()
         if wrapper is None or optimization_settings is None:
             raise ValueError("wrapper and optimization_settings are required for serial mode.")
         wrapper._configure_torch_threads(optimization_settings)
         return
     torch.set_num_threads(1)
+    if _PARENT_AUTOGRAD_MULTITHREADING_ENABLED is None:
+        _PARENT_AUTOGRAD_MULTITHREADING_ENABLED = torch.autograd.is_multithreading_enabled()
+    torch.autograd.set_multithreading_enabled(False)
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
@@ -197,55 +222,59 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
         return {"mode": mode, "workers": workers, "skipped": "cuda unavailable"}
 
     parallel_acq_settings = parallel_settings(mode, workers, args)
-    if parallel_acq_settings is not None:
-        configure_parent_torch_threads(parallel_acq_settings)
-    wrapper = load_wrapper(args, device=device)
-    optimization_settings = wrapper._resolve_optimization_settings()
-    if parallel_acq_settings is None:
-        configure_parent_torch_threads(parallel_acq_settings, wrapper, optimization_settings)
-    model = wrapper.load_model(args.learner_file)
-    risk_objective = build_risk_state(wrapper, model, args)
-    model.eval()
+    try:
+        if parallel_acq_settings is not None:
+            configure_parent_torch_threads(parallel_acq_settings)
+        wrapper = load_wrapper(args, device=device)
+        optimization_settings = wrapper._resolve_optimization_settings()
+        if parallel_acq_settings is None:
+            configure_parent_torch_threads(parallel_acq_settings, wrapper, optimization_settings)
+        model = wrapper.load_model(args.learner_file)
+        risk_objective = build_risk_state(wrapper, model, args)
+        model.eval()
 
-    fidelity_cost = None
-    if wrapper.multi_fidelity:
-        fidelity_cost = np.array(json.loads(args.fidelity_cost), dtype=np.float32)
+        fidelity_cost = None
+        if wrapper.multi_fidelity:
+            fidelity_cost = np.array(json.loads(args.fidelity_cost), dtype=np.float32)
 
-    if device == "cuda":
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    candidates, acq_value = wrapper.get_candidates(
-        model=model,
-        acq_method=args.acq_method,
-        q=args.num_candidates,
-        risk_objective=risk_objective,
-        risk_n_deltas=args.risk_n_deltas,
-        fidelity_cost=fidelity_cost,
-        propose_best=args.propose_best,
-        optimization_settings=optimization_settings,
-        parallel_acq=parallel_acq_settings,
-    )
-    if device == "cuda":
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        if device == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        candidates, acq_value = wrapper.get_candidates(
+            model=model,
+            acq_method=args.acq_method,
+            q=args.num_candidates,
+            risk_objective=risk_objective,
+            risk_n_deltas=args.risk_n_deltas,
+            fidelity_cost=fidelity_cost,
+            propose_best=args.propose_best,
+            optimization_settings=optimization_settings,
+            parallel_acq=parallel_acq_settings,
+        )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
 
-    return {
-        "mode": mode,
-        "workers": workers,
-        "worker_torch_num_threads": (
-            parallel_acq_settings["worker_torch_num_threads"] if parallel_acq_settings is not None else None
-        ),
-        "worker_torch_num_interop_threads": (
-            parallel_acq_settings["worker_torch_num_interop_threads"] if parallel_acq_settings is not None else None
-        ),
-        "device": device,
-        "elapsed_seconds": elapsed,
-        "candidate_shape": list(candidates.shape),
-        "acq_value": acq_value.detach().cpu().reshape(-1).tolist() if torch.is_tensor(acq_value) else str(acq_value),
-        "optimization_settings": optimization_settings.__dict__,
-        "torch_threads": torch.get_num_threads(),
-        "torch_interop_threads": torch.get_num_interop_threads(),
-    }
+        return {
+            "mode": mode,
+            "workers": workers,
+            "worker_torch_num_threads": (
+                parallel_acq_settings["worker_torch_num_threads"] if parallel_acq_settings is not None else None
+            ),
+            "worker_torch_num_interop_threads": (
+                parallel_acq_settings["worker_torch_num_interop_threads"] if parallel_acq_settings is not None else None
+            ),
+            "device": device,
+            "elapsed_seconds": elapsed,
+            "candidate_shape": list(candidates.shape),
+            "acq_value": acq_value.detach().cpu().reshape(-1).tolist() if torch.is_tensor(acq_value) else str(acq_value),
+            "optimization_settings": optimization_settings.__dict__,
+            "torch_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
+        }
+    finally:
+        if parallel_acq_settings is not None:
+            restore_parent_autograd_multithreading()
 
 
 def main() -> None:
