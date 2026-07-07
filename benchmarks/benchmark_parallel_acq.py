@@ -45,7 +45,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--worker-torch-num-threads", type=int)
     parser.add_argument("--total-worker-torch-threads", type=int, default=64)
-    parser.add_argument("--worker-torch-num-interop-threads", type=int, default=1)
+    parser.add_argument("--worker-torch-num-interop-threads", type=int)
+    parser.add_argument("--total-worker-torch-num-interop-threads", type=int, default=64)
     return parser.parse_args(argv)
 
 
@@ -117,18 +118,44 @@ def mode_device(mode: str) -> Optional[str]:
     return "cpu"
 
 
-def worker_torch_num_threads_for_workers(workers: int, args: argparse.Namespace) -> int:
+def worker_threads_for_workers(
+    workers: int,
+    explicit_threads: Optional[int],
+    total_threads: int,
+    thread_name: str,
+    total_thread_name: str,
+) -> int:
     if workers <= 0:
         raise ValueError("workers must be positive.")
-    if args.worker_torch_num_threads is not None:
-        if args.worker_torch_num_threads <= 0:
-            raise ValueError("worker_torch_num_threads must be positive.")
-        return args.worker_torch_num_threads
-    if args.total_worker_torch_threads <= 0:
-        raise ValueError("total_worker_torch_threads must be positive.")
-    if args.total_worker_torch_threads % workers != 0:
-        raise ValueError("total_worker_torch_threads must be divisible by workers.")
-    return args.total_worker_torch_threads // workers
+    if explicit_threads is not None:
+        if explicit_threads <= 0:
+            raise ValueError(f"{thread_name} must be positive.")
+        return explicit_threads
+    if total_threads <= 0:
+        raise ValueError(f"{total_thread_name} must be positive.")
+    if total_threads % workers != 0:
+        raise ValueError(f"{total_thread_name} must be divisible by workers.")
+    return total_threads // workers
+
+
+def worker_torch_num_threads_for_workers(workers: int, args: argparse.Namespace) -> int:
+    return worker_threads_for_workers(
+        workers,
+        args.worker_torch_num_threads,
+        args.total_worker_torch_threads,
+        "worker_torch_num_threads",
+        "total_worker_torch_threads",
+    )
+
+
+def worker_torch_num_interop_threads_for_workers(workers: int, args: argparse.Namespace) -> int:
+    return worker_threads_for_workers(
+        workers,
+        args.worker_torch_num_interop_threads,
+        args.total_worker_torch_num_interop_threads,
+        "worker_torch_num_interop_threads",
+        "total_worker_torch_num_interop_threads",
+    )
 
 
 def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Optional[Dict[str, object]]:
@@ -138,7 +165,7 @@ def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Opti
         "enabled": True,
         "num_workers": workers,
         "worker_torch_num_threads": worker_torch_num_threads_for_workers(workers, args),
-        "worker_torch_num_interop_threads": args.worker_torch_num_interop_threads,
+        "worker_torch_num_interop_threads": worker_torch_num_interop_threads_for_workers(workers, args),
     }
 
 
@@ -189,6 +216,9 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
         "workers": workers,
         "worker_torch_num_threads": (
             parallel_acq_settings["worker_torch_num_threads"] if parallel_acq_settings is not None else None
+        ),
+        "worker_torch_num_interop_threads": (
+            parallel_acq_settings["worker_torch_num_interop_threads"] if parallel_acq_settings is not None else None
         ),
         "device": device,
         "elapsed_seconds": elapsed,
