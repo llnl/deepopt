@@ -1,8 +1,10 @@
 import pytest
 
 from benchmarks.benchmark_parallel_acq import (
+    configure_parent_torch_threads,
     parallel_settings,
     parse_args,
+    run_once,
     worker_torch_num_interop_threads_for_workers,
     worker_torch_num_threads_for_workers,
 )
@@ -55,3 +57,86 @@ def test_nondivisible_thread_budget_raises_clear_error():
         worker_torch_num_threads_for_workers(3, args)
     with pytest.raises(ValueError, match="total_worker_torch_num_interop_threads must be divisible by workers"):
         worker_torch_num_interop_threads_for_workers(3, args)
+
+
+def test_parallel_mode_constrains_parent_torch_threads(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_interop_threads", lambda value: calls.append(("interop", value)))
+
+    configure_parent_torch_threads({"enabled": True})
+
+    assert calls == [("threads", 1), ("interop", 1)]
+
+
+def test_serial_mode_uses_configured_torch_threads(monkeypatch):
+    calls = []
+    wrapper = type("Wrapper", (), {"_configure_torch_threads": lambda self, settings: calls.append(("wrapper", settings))})()
+
+    configure_parent_torch_threads(None, wrapper, "settings")
+
+    assert calls == [("wrapper", "settings")]
+
+
+def test_parallel_run_constrains_parent_before_loading_wrapper(monkeypatch):
+    calls = []
+    args = parse_args(["--learner-file", "model.pt", "--workers", "2"])
+
+    class FakeValue:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def reshape(self, *_shape):
+            return self
+
+        def tolist(self):
+            return [0.0]
+
+    class FakeCandidates:
+        shape = (1, 2)
+
+    class FakeModel:
+        def eval(self):
+            calls.append("model.eval")
+
+    class FakeSettings:
+        pass
+
+    settings = FakeSettings()
+
+    class FakeWrapper:
+        multi_fidelity = False
+
+        def _resolve_optimization_settings(self):
+            calls.append("resolve_settings")
+            return settings
+
+        def _configure_torch_threads(self, settings):
+            calls.append(("wrapper_threads", settings))
+
+        def load_model(self, learner_file):
+            calls.append(("load_model", learner_file))
+            return FakeModel()
+
+        def get_candidates(self, **kwargs):
+            calls.append("get_candidates")
+            return FakeCandidates(), FakeValue()
+
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_threads", lambda value: calls.append(("threads", value)))
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.set_num_interop_threads", lambda value: calls.append(("interop", value)))
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.torch.is_tensor", lambda value: True)
+
+    def fake_load_wrapper(args, device):
+        calls.append("load_wrapper")
+        return FakeWrapper()
+
+    monkeypatch.setattr("benchmarks.benchmark_parallel_acq.load_wrapper", fake_load_wrapper)
+
+    run_once(args, "cpu-parallel", 2)
+
+    assert calls[:3] == [("threads", 1), ("interop", 1), "load_wrapper"]
+    assert ("wrapper_threads", settings) not in calls

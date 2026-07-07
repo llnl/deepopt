@@ -170,6 +170,21 @@ def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Opti
     }
 
 
+def configure_parent_torch_threads(
+    parallel_acq_settings: Optional[Dict[str, object]], wrapper=None, optimization_settings=None
+) -> None:
+    if parallel_acq_settings is None:
+        if wrapper is None or optimization_settings is None:
+            raise ValueError("wrapper and optimization_settings are required for serial mode.")
+        wrapper._configure_torch_threads(optimization_settings)
+        return
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
 def worker_counts_for_mode(mode: str, workers: Iterable[int]) -> Iterable[int]:
     if "parallel" in mode:
         return workers
@@ -181,9 +196,13 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
     if device is None:
         return {"mode": mode, "workers": workers, "skipped": "cuda unavailable"}
 
+    parallel_acq_settings = parallel_settings(mode, workers, args)
+    if parallel_acq_settings is not None:
+        configure_parent_torch_threads(parallel_acq_settings)
     wrapper = load_wrapper(args, device=device)
     optimization_settings = wrapper._resolve_optimization_settings()
-    wrapper._configure_torch_threads(optimization_settings)
+    if parallel_acq_settings is None:
+        configure_parent_torch_threads(parallel_acq_settings, wrapper, optimization_settings)
     model = wrapper.load_model(args.learner_file)
     risk_objective = build_risk_state(wrapper, model, args)
     model.eval()
@@ -191,8 +210,6 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
     fidelity_cost = None
     if wrapper.multi_fidelity:
         fidelity_cost = np.array(json.loads(args.fidelity_cost), dtype=np.float32)
-
-    parallel_acq_settings = parallel_settings(mode, workers, args)
 
     if device == "cuda":
         torch.cuda.synchronize()
