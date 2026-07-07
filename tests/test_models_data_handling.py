@@ -7,7 +7,14 @@ pytest.importorskip("gpytorch")
 pytest.importorskip("ray")
 
 from deepopt.configuration import ConfigSettings
-from deepopt.parallel_acq import select_best, split_list_by_workers, split_tensor_by_workers
+from deepopt.parallel_acq import (
+    ParallelAcqSettings,
+    _optimize_acqf_worker,
+    parallel_optimize_acqf,
+    select_best,
+    split_list_by_workers,
+    split_tensor_by_workers,
+)
 from deepopt.models import (
     DEEPOPT_CHECKPOINT_KEY,
     AcquisitionOptimizationSettings,
@@ -521,6 +528,57 @@ def test_parallel_acq_split_and_select_helpers():
     best_candidate, best_value = select_best(candidates, values)
     torch.testing.assert_close(best_candidate, torch.tensor([0.9]))
     torch.testing.assert_close(best_value, torch.tensor(5.0))
+
+
+def test_parallel_acq_worker_accepts_legacy_payload(monkeypatch):
+    captured = {}
+
+    def fake_optimize_acqf(**kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.4]]), torch.tensor([2.0])
+
+    monkeypatch.setattr("deepopt.parallel_acq.optimize_acqf", fake_optimize_acqf)
+
+    candidates, acq_values, warning_messages = _optimize_acqf_worker(
+        {
+            "settings": ParallelAcqSettings(worker_torch_num_interop_threads=None),
+            "bounds": torch.tensor([[0.0], [1.0]]),
+            "q": 1,
+            "num_restarts": 1,
+            "batch_initial_conditions": torch.tensor([[[0.4]]]),
+        }
+    )
+
+    assert captured["num_restarts"] == 1
+    torch.testing.assert_close(candidates, torch.tensor([[0.4]]))
+    torch.testing.assert_close(acq_values, torch.tensor([2.0]))
+    assert warning_messages == []
+
+
+def test_parallel_acq_fork_workers_share_unpicklable_acq_function(monkeypatch):
+    settings = ParallelAcqSettings(enabled=True, num_workers=2, start_method="fork", worker_torch_num_interop_threads=None)
+
+    def fake_gen_initial_conditions(**kwargs):
+        return torch.tensor([[[0.2]], [[0.8]]])
+
+    def fake_optimize_acqf(**kwargs):
+        assert kwargs["acq_function"]() == "local-object"
+        return kwargs["batch_initial_conditions"].squeeze(1), torch.arange(kwargs["num_restarts"], dtype=torch.float32)
+
+    monkeypatch.setattr("deepopt.parallel_acq._gen_initial_conditions", fake_gen_initial_conditions)
+    monkeypatch.setattr("deepopt.parallel_acq.optimize_acqf", fake_optimize_acqf)
+
+    candidates, acq_values = parallel_optimize_acqf(
+        settings=settings,
+        acq_function=lambda: "local-object",
+        bounds=torch.tensor([[0.0], [1.0]]),
+        q=1,
+        num_restarts=2,
+        raw_samples=2,
+    )
+
+    torch.testing.assert_close(candidates, torch.tensor([0.2]))
+    torch.testing.assert_close(acq_values, torch.tensor(0.0))
 
 
 def test_fidelity_cost_model_uses_rounded_last_column():

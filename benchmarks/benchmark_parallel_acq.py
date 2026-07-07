@@ -39,7 +39,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["gpu-serial", "cpu-serial", "cpu-parallel", "cpu-parallel-from-checkpoint"],
+        default=["cpu-parallel", "cpu-parallel-from-checkpoint"],
         choices=["gpu-serial", "cpu-serial", "cpu-parallel", "cpu-parallel-from-checkpoint"],
     )
     parser.add_argument("--repeat", type=int, default=1)
@@ -164,6 +164,7 @@ def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Opti
     return {
         "enabled": True,
         "num_workers": workers,
+        "start_method": "fork",
         "worker_torch_num_threads": worker_torch_num_threads_for_workers(workers, args),
         "worker_torch_num_interop_threads": worker_torch_num_interop_threads_for_workers(workers, args),
     }

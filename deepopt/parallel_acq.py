@@ -73,12 +73,27 @@ def _set_worker_torch_threads(settings: ParallelAcqSettings) -> None:
             pass
 
 
-def _optimize_acqf_worker(payload: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    settings = payload.pop("settings")
+_OPTIMIZE_ACQF_WORKER_SHARED_KWARGS: Optional[Dict[str, Any]] = None
+
+
+def _initialize_optimize_acqf_worker(shared_kwargs: Dict[str, Any], settings: ParallelAcqSettings) -> None:
+    global _OPTIMIZE_ACQF_WORKER_SHARED_KWARGS
+    _OPTIMIZE_ACQF_WORKER_SHARED_KWARGS = shared_kwargs
     _set_worker_torch_threads(settings)
+
+
+def _optimize_acqf_worker(payload: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    shared_kwargs = _OPTIMIZE_ACQF_WORKER_SHARED_KWARGS
+    if shared_kwargs is None:
+        settings = payload["settings"]
+        _set_worker_torch_threads(settings)
+        worker_kwargs = {key: value for key, value in payload.items() if key != "settings"}
+    else:
+        worker_kwargs = dict(shared_kwargs)
+        worker_kwargs.update(payload)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        candidates, acq_values = optimize_acqf(**payload)
+        candidates, acq_values = optimize_acqf(**worker_kwargs)
     warning_messages = [str(w.message) for w in caught]
     return candidates.detach().cpu(), acq_values.detach().cpu(), warning_messages
 
@@ -209,28 +224,37 @@ def parallel_optimize_acqf(
     chunks = split_tensor_by_workers(batch_initial_conditions, settings.num_workers)
 
     def run_workers(initial_condition_chunks: List[torch.Tensor]) -> List[Tuple[torch.Tensor, torch.Tensor, List[str]]]:
-        worker_payloads = []
-        for chunk in initial_condition_chunks:
-            worker_payloads.append(
-                {
-                    "settings": settings,
-                    "acq_function": acq_function,
-                    "bounds": bounds,
-                    "q": q,
-                    "num_restarts": chunk.shape[0],
-                    "raw_samples": raw_samples,
-                    "options": options or {},
-                    "inequality_constraints": inequality_constraints,
-                    "equality_constraints": equality_constraints,
-                    "nonlinear_inequality_constraints": None,
-                    "fixed_features": fixed_features,
-                    "post_processing_func": post_processing_func,
-                    "batch_initial_conditions": chunk,
-                    "return_best_only": False,
-                    "sequential": False,
-                    **kwargs,
-                }
-            )
+        worker_payloads = [
+            {
+                "num_restarts": chunk.shape[0],
+                "batch_initial_conditions": chunk,
+            }
+            for chunk in initial_condition_chunks
+        ]
+        shared_kwargs = {
+            "acq_function": acq_function,
+            "bounds": bounds,
+            "q": q,
+            "raw_samples": raw_samples,
+            "options": options or {},
+            "inequality_constraints": inequality_constraints,
+            "equality_constraints": equality_constraints,
+            "nonlinear_inequality_constraints": None,
+            "fixed_features": fixed_features,
+            "post_processing_func": post_processing_func,
+            "return_best_only": False,
+            "sequential": False,
+            **kwargs,
+        }
+        if settings.start_method == "fork":
+            context = mp.get_context(settings.start_method)
+            with context.Pool(
+                processes=min(settings.num_workers, len(worker_payloads)),
+                initializer=_initialize_optimize_acqf_worker,
+                initargs=(shared_kwargs, settings),
+            ) as pool:
+                return pool.map(_optimize_acqf_worker, worker_payloads)
+        worker_payloads = [{"settings": settings, **shared_kwargs, **payload} for payload in worker_payloads]
         context = mp.get_context(settings.start_method)
         with context.Pool(processes=min(settings.num_workers, len(worker_payloads))) as pool:
             return pool.map(_optimize_acqf_worker, worker_payloads)
