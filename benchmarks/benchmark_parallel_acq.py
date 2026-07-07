@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 import numpy as np
 import torch
@@ -19,7 +19,7 @@ from deepopt.deepopt_cli import get_deepopt_model
 from deepopt.models import get_checkpoint_metadata, load_deepopt_wrapper
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--learner-file", required=True)
     parser.add_argument("--infile")
@@ -43,9 +43,10 @@ def parse_args() -> argparse.Namespace:
         choices=["gpu-serial", "cpu-serial", "cpu-parallel", "cpu-parallel-from-checkpoint"],
     )
     parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--worker-torch-num-threads", type=int, default=1)
+    parser.add_argument("--worker-torch-num-threads", type=int)
+    parser.add_argument("--total-worker-torch-threads", type=int, default=64)
     parser.add_argument("--worker-torch-num-interop-threads", type=int, default=1)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def env_summary() -> Dict[str, object]:
@@ -116,13 +117,27 @@ def mode_device(mode: str) -> Optional[str]:
     return "cpu"
 
 
+def worker_torch_num_threads_for_workers(workers: int, args: argparse.Namespace) -> int:
+    if workers <= 0:
+        raise ValueError("workers must be positive.")
+    if args.worker_torch_num_threads is not None:
+        if args.worker_torch_num_threads <= 0:
+            raise ValueError("worker_torch_num_threads must be positive.")
+        return args.worker_torch_num_threads
+    if args.total_worker_torch_threads <= 0:
+        raise ValueError("total_worker_torch_threads must be positive.")
+    if args.total_worker_torch_threads % workers != 0:
+        raise ValueError("total_worker_torch_threads must be divisible by workers.")
+    return args.total_worker_torch_threads // workers
+
+
 def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Optional[Dict[str, object]]:
     if "parallel" not in mode:
         return None
     return {
         "enabled": True,
         "num_workers": workers,
-        "worker_torch_num_threads": args.worker_torch_num_threads,
+        "worker_torch_num_threads": worker_torch_num_threads_for_workers(workers, args),
         "worker_torch_num_interop_threads": args.worker_torch_num_interop_threads,
     }
 
@@ -149,6 +164,8 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
     if wrapper.multi_fidelity:
         fidelity_cost = np.array(json.loads(args.fidelity_cost), dtype=np.float32)
 
+    parallel_acq_settings = parallel_settings(mode, workers, args)
+
     if device == "cuda":
         torch.cuda.synchronize()
     start = time.perf_counter()
@@ -161,7 +178,7 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
         fidelity_cost=fidelity_cost,
         propose_best=args.propose_best,
         optimization_settings=optimization_settings,
-        parallel_acq=parallel_settings(mode, workers, args),
+        parallel_acq=parallel_acq_settings,
     )
     if device == "cuda":
         torch.cuda.synchronize()
@@ -170,6 +187,9 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
     return {
         "mode": mode,
         "workers": workers,
+        "worker_torch_num_threads": (
+            parallel_acq_settings["worker_torch_num_threads"] if parallel_acq_settings is not None else None
+        ),
         "device": device,
         "elapsed_seconds": elapsed,
         "candidate_shape": list(candidates.shape),
