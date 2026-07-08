@@ -50,7 +50,7 @@ OPTIMIZATION_PROFILES = {
         "num_restarts_low": 5,
         "raw_samples_high": 5000,
         "raw_samples_low": 512,
-        "batch_limit_high": 10,
+        "batch_limit_high": 15,
         "batch_limit_low": 5,
         "maxiter": 200,
         "n_fantasies": 128,

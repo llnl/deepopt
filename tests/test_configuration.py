@@ -97,6 +97,7 @@ def test_optimization_profiles_include_legacy_and_large_cpu_defaults():
     assert set(OPTIMIZATION_PROFILES) == {"balanced", "cpu_large", "fast"}
     assert OPTIMIZATION_PROFILES["balanced"]["num_restarts_high"] == 15
     assert OPTIMIZATION_PROFILES["balanced"]["raw_samples_high"] == 5000
+    assert OPTIMIZATION_PROFILES["balanced"]["batch_limit_high"] == OPTIMIZATION_PROFILES["balanced"]["num_restarts_high"]
     assert OPTIMIZATION_PROFILES["balanced"]["n_fantasies"] == 128
     assert OPTIMIZATION_PROFILES["cpu_large"]["num_restarts_high"] == Defaults.num_restarts_high
     assert OPTIMIZATION_PROFILES["cpu_large"]["batch_limit_high"] == Defaults.batch_limit_high
