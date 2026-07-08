@@ -42,7 +42,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["cpu-parallel"],
+        default=["cpu-parallel", "cpu-parallel-from-checkpoint"],
         choices=["gpu-serial", "cpu-serial", "cpu-parallel", "cpu-parallel-from-checkpoint"],
     )
     parser.add_argument("--repeat", type=int, default=1)
@@ -162,12 +162,10 @@ def worker_torch_num_interop_threads_for_workers(workers: int, args: argparse.Na
     )
 
 
-def start_method_for_mode(mode: str, args: argparse.Namespace) -> str:
+def start_method_for_args(args: argparse.Namespace) -> str:
     if args.start_method != "auto":
         return args.start_method
-    if mode == "cpu-parallel-from-checkpoint":
-        return "fork"
-    return "spawn"
+    return "fork"
 
 
 def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Optional[Dict[str, object]]:
@@ -176,7 +174,7 @@ def parallel_settings(mode: str, workers: int, args: argparse.Namespace) -> Opti
     return {
         "enabled": True,
         "num_workers": workers,
-        "start_method": start_method_for_mode(mode, args),
+        "start_method": start_method_for_args(args),
         "worker_torch_num_threads": worker_torch_num_threads_for_workers(workers, args),
         "worker_torch_num_interop_threads": worker_torch_num_interop_threads_for_workers(workers, args),
     }
@@ -258,6 +256,7 @@ def run_once(args: argparse.Namespace, mode: str, workers: int) -> Dict[str, obj
         return {
             "mode": mode,
             "workers": workers,
+            "start_method": parallel_acq_settings["start_method"] if parallel_acq_settings is not None else None,
             "worker_torch_num_threads": (
                 parallel_acq_settings["worker_torch_num_threads"] if parallel_acq_settings is not None else None
             ),

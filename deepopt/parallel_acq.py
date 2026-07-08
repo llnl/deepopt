@@ -59,6 +59,19 @@ def split_list_by_workers(values: Sequence[Any], num_workers: int) -> List[List[
     return [list(values[i : i + chunk_size]) for i in range(0, len(values), chunk_size)]
 
 
+def split_count_by_workers(value: int, num_workers: int) -> List[int]:
+    chunks = min(value, num_workers)
+    base, extra = divmod(value, chunks)
+    return [base + (idx < extra) for idx in range(chunks)]
+
+
+def options_with_seed_offset(options: Optional[Dict[str, Any]], offset: int) -> Dict[str, Any]:
+    worker_options = dict(options or {})
+    if "seed" in worker_options and worker_options["seed"] is not None:
+        worker_options["seed"] = int(worker_options["seed"]) + offset
+    return worker_options
+
+
 def select_best(candidates: torch.Tensor, acq_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     best = torch.argmax(acq_values.view(-1), dim=0)
     return candidates[best], acq_values.view(-1)[best]
@@ -93,6 +106,18 @@ def _optimize_acqf_worker(payload: Dict[str, Any]) -> Tuple[torch.Tensor, torch.
     else:
         worker_kwargs = dict(shared_kwargs)
         worker_kwargs.update(payload)
+    if worker_kwargs.get("batch_initial_conditions") is None:
+        worker_kwargs["batch_initial_conditions"] = _gen_initial_conditions(
+            acq_function=worker_kwargs["acq_function"],
+            bounds=worker_kwargs["bounds"],
+            q=worker_kwargs["q"],
+            num_restarts=worker_kwargs["num_restarts"],
+            raw_samples=worker_kwargs["raw_samples"],
+            fixed_features=worker_kwargs["fixed_features"],
+            options=worker_kwargs["options"],
+            inequality_constraints=worker_kwargs["inequality_constraints"],
+            equality_constraints=worker_kwargs["equality_constraints"],
+        )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         candidates, acq_values = optimize_acqf(**worker_kwargs)
@@ -210,7 +235,8 @@ def parallel_optimize_acqf(
         return candidates, torch.stack(acq_value_list)
 
     initial_conditions_provided = batch_initial_conditions is not None
-    if not initial_conditions_provided:
+    defer_initial_conditions_to_fork_workers = settings.start_method == "fork" and not initial_conditions_provided
+    if not initial_conditions_provided and not defer_initial_conditions_to_fork_workers:
         batch_initial_conditions = _gen_initial_conditions(
             acq_function=acq_function,
             bounds=bounds,
@@ -223,16 +249,29 @@ def parallel_optimize_acqf(
             equality_constraints=equality_constraints,
         )
 
-    chunks = split_tensor_by_workers(batch_initial_conditions, settings.num_workers)
+    if batch_initial_conditions is None:
+        restart_chunks = split_count_by_workers(num_restarts, settings.num_workers)
+    else:
+        restart_chunks = split_tensor_by_workers(batch_initial_conditions, settings.num_workers)
 
-    def run_workers(initial_condition_chunks: List[torch.Tensor]) -> List[Tuple[torch.Tensor, torch.Tensor, List[str]]]:
-        worker_payloads = [
-            {
-                "num_restarts": chunk.shape[0],
-                "batch_initial_conditions": chunk,
-            }
-            for chunk in initial_condition_chunks
-        ]
+    def run_workers(worker_chunks: List[Union[int, torch.Tensor]], seed_offset: int = 0) -> List[Tuple[torch.Tensor, torch.Tensor, List[str]]]:
+        worker_payloads = []
+        for worker_idx, chunk in enumerate(worker_chunks):
+            if isinstance(chunk, int):
+                worker_payloads.append(
+                    {
+                        "num_restarts": chunk,
+                        "batch_initial_conditions": None,
+                        "options": options_with_seed_offset(options, seed_offset + worker_idx),
+                    }
+                )
+            else:
+                worker_payloads.append(
+                    {
+                        "num_restarts": chunk.shape[0],
+                        "batch_initial_conditions": chunk,
+                    }
+                )
         shared_kwargs = {
             "acq_function": acq_function,
             "bounds": bounds,
@@ -261,23 +300,26 @@ def parallel_optimize_acqf(
         with context.Pool(processes=min(settings.num_workers, len(worker_payloads))) as pool:
             return pool.map(_optimize_acqf_worker, worker_payloads)
 
-    worker_results = run_workers(chunks)
+    worker_results = run_workers(restart_chunks)
 
     warning_messages = [message for _, _, messages in worker_results for message in messages]
     if warning_messages and not initial_conditions_provided:
-        batch_initial_conditions = _gen_initial_conditions(
-            acq_function=acq_function,
-            bounds=bounds,
-            q=q,
-            num_restarts=num_restarts,
-            raw_samples=raw_samples,
-            fixed_features=fixed_features,
-            options=options,
-            inequality_constraints=inequality_constraints,
-            equality_constraints=equality_constraints,
-            seed_offset=1,
-        )
-        worker_results = run_workers(split_tensor_by_workers(batch_initial_conditions, settings.num_workers))
+        if defer_initial_conditions_to_fork_workers:
+            worker_results = run_workers(restart_chunks, seed_offset=len(restart_chunks))
+        else:
+            batch_initial_conditions = _gen_initial_conditions(
+                acq_function=acq_function,
+                bounds=bounds,
+                q=q,
+                num_restarts=num_restarts,
+                raw_samples=raw_samples,
+                fixed_features=fixed_features,
+                options=options,
+                inequality_constraints=inequality_constraints,
+                equality_constraints=equality_constraints,
+                seed_offset=1,
+            )
+            worker_results = run_workers(split_tensor_by_workers(batch_initial_conditions, settings.num_workers))
         warning_messages = [message for _, _, messages in worker_results for message in messages]
         if warning_messages:
             warnings.warn("Optimization failed on the second parallel try after generating new initial conditions.", RuntimeWarning)

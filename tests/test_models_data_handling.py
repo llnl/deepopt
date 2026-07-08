@@ -11,8 +11,10 @@ from deepopt.parallel_acq import (
     ParallelAcqSettings,
     _optimize_acqf_worker,
     _set_worker_torch_threads,
+    options_with_seed_offset,
     parallel_optimize_acqf,
     select_best,
+    split_count_by_workers,
     split_list_by_workers,
     split_tensor_by_workers,
 )
@@ -523,12 +525,19 @@ def test_parallel_acq_split_and_select_helpers():
 
     list_chunks = split_list_by_workers([{0: i} for i in range(5)], 2)
     assert [len(chunk) for chunk in list_chunks] == [3, 2]
+    assert split_count_by_workers(5, 2) == [3, 2]
+    assert split_count_by_workers(2, 8) == [1, 1]
 
     candidates = torch.tensor([[0.1], [0.9], [0.3]])
     values = torch.tensor([1.0, 5.0, 2.0])
     best_candidate, best_value = select_best(candidates, values)
     torch.testing.assert_close(best_candidate, torch.tensor([0.9]))
     torch.testing.assert_close(best_value, torch.tensor(5.0))
+
+
+def test_options_with_seed_offset_preserves_unseeded_options():
+    assert options_with_seed_offset({"batch_limit": 2}, 5) == {"batch_limit": 2}
+    assert options_with_seed_offset({"seed": 3}, 5) == {"seed": 8}
 
 
 def test_parallel_acq_worker_accepts_legacy_payload(monkeypatch):

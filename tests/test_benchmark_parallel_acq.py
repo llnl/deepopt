@@ -25,27 +25,21 @@ def test_parallel_settings_uses_default_thread_budget():
         settings = parallel_settings("cpu-parallel", workers, args)
 
         assert settings["num_workers"] == workers
-        assert settings["start_method"] == "spawn"
+        assert settings["start_method"] == "fork"
         assert settings["worker_torch_num_threads"] * workers == 64
         assert settings["worker_torch_num_interop_threads"] * workers == 64
 
 
-def test_parallel_from_checkpoint_uses_fork_for_unpicklable_acquisitions():
+def test_default_modes_run_both_parallel_paths():
     args = parse_args(["--learner-file", "model.pt"])
 
-    assert parallel_settings("cpu-parallel-from-checkpoint", 2, args)["start_method"] == "fork"
+    assert args.modes == ["cpu-parallel", "cpu-parallel-from-checkpoint"]
 
 
 def test_explicit_start_method_override_is_preserved():
     args = parse_args(["--learner-file", "model.pt", "--start-method", "fork"])
 
     assert parallel_settings("cpu-parallel", 2, args)["start_method"] == "fork"
-
-
-def test_default_modes_only_run_spawn_safe_parallel_path():
-    args = parse_args(["--learner-file", "model.pt"])
-
-    assert args.modes == ["cpu-parallel"]
 
 
 def test_serial_mode_has_no_parallel_settings():
