@@ -26,3 +26,6 @@ deepopt_venv/
 *.DS_Store
 *.rdb
 throwaway
+
+#Benchmarks
+benchmarks/
