@@ -239,6 +239,14 @@ def create_optimizer(network: Type[nn.Module], config: ConfigSettings) -> Union[
 
 
 def proposed_lr(config, epoch, epoch_per_cycle):
+    """
+    Compute a cosine-annealed learning rate for one snapshot ensemble cycle.
+
+    :param config: Mapping containing ``learning_rate``.
+    :param epoch: Current training epoch.
+    :param epoch_per_cycle: Number of epochs in one cosine cycle.
+    :returns: The learning rate for ``epoch``.
+    """
     # Cosine Annealing Learning Rate Update
     # https://github.com/moskomule/pytorch.snapshot.ensembles/blob/master/se.py
     iteration = int(epoch % epoch_per_cycle)
@@ -246,6 +254,14 @@ def proposed_lr(config, epoch, epoch_per_cycle):
 
 
 def prepare_cut_mix_batch(config, input, target):
+    """
+    Create a CutMix-style mixed batch for tabular inputs.
+
+    :param config: Mapping containing the beta-distribution parameter ``beta``.
+    :param input: Input batch with shape ``n x d``.
+    :param target: Target batch aligned with ``input``.
+    :returns: ``(mixed_input, target_a, target_b, lam)`` for CutMix loss evaluation.
+    """
     # Generate Mixed Sample
     # https://github.com/clovaai/CutMix-PyTorch/blob/master/train.py
     lam = np.random.beta(config["beta"], config["beta"])

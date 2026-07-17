@@ -4,6 +4,7 @@ It's where we handle the configuration of each model (i.e. how we process
 the `learn` and `optimize` commands for each model).
 """
 import json
+import os
 import random
 import warnings
 from abc import ABC, abstractmethod
@@ -28,7 +29,6 @@ from botorch.models.deterministic import DeterministicModel
 from botorch.models.gp_regression_fidelity import SingleTaskGP, SingleTaskMultiFidelityGP
 from botorch.models.model import Model
 from botorch.models.transforms.input import InputPerturbation
-from botorch.models.transforms.outcome import Standardize
 from botorch.optim.optimize import optimize_acqf, optimize_acqf_mixed
 from botorch.sampling.qmc import MultivariateNormalQMCEngine
 from botorch.sampling.samplers import SobolQMCNormalSampler
@@ -41,11 +41,182 @@ from torch.utils.data import DataLoader, SubsetRandomSampler, TensorDataset
 
 from deepopt.acquisition import qMaxValueEntropy, qMultiFidelityLowerBoundMaxValueEntropy, qMultiFidelityMaxValueEntropy
 from deepopt.configuration import ConfigSettings
-from deepopt.defaults import Defaults
+from deepopt.defaults import Defaults, OPTIMIZATION_PROFILES
 from deepopt.deltaenc import DeltaEnc
+from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.nn_ensemble import NNEnsemble
+from deepopt.output_scaling import OutputScaler, StandardizeOutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
+
+
+DEEPOPT_CHECKPOINT_KEY = "deepopt_checkpoint"
+DEEPOPT_CHECKPOINT_SCHEMA_VERSION = 1
+OPTIMIZATION_SETTING_KEYS = frozenset(next(iter(OPTIMIZATION_PROFILES.values())).keys())
+OPTIMIZATION_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "TORCH_NUM_THREADS")
+
+
+@dataclass(frozen=True)
+class AcquisitionOptimizationSettings:
+    """
+    Resolved acquisition optimizer settings.
+
+    The ``high`` settings are used for normal acquisition optimization paths, while
+    the ``low`` settings are used for more expensive acquisition functions such as
+    KG and MaxValEntropy. Thread settings apply only to CPU optimization.
+
+    :cvar num_restarts_high: Multistart local optimizations for high-budget paths.
+    :cvar num_restarts_low: Multistart local optimizations for low-budget paths.
+    :cvar raw_samples_high: Sobol samples used to initialize high-budget paths.
+    :cvar raw_samples_low: Sobol samples used to initialize low-budget paths.
+    :cvar batch_limit_high: Restart batches evaluated together for high-budget paths.
+    :cvar batch_limit_low: Restart batches evaluated together for low-budget paths.
+    :cvar maxiter: Maximum iterations for each local optimizer run.
+    :cvar n_fantasies: Number of fantasy models used by KG/MES-family acquisitions.
+    :cvar torch_num_threads: PyTorch intra-op threads, ``"auto"``, or ``None``.
+    :cvar torch_num_threads_fraction: Fraction of available CPUs used by ``"auto"``.
+    :cvar torch_num_interop_threads: PyTorch inter-op thread count, or ``None``.
+    """
+
+    num_restarts_high: int
+    num_restarts_low: int
+    raw_samples_high: int
+    raw_samples_low: int
+    batch_limit_high: int
+    batch_limit_low: int
+    maxiter: int
+    n_fantasies: int
+    torch_num_threads: Optional[Union[int, str]]
+    torch_num_threads_fraction: float
+    torch_num_interop_threads: Optional[int]
+
+
+
+def _torch_load(learner_file: str, map_location: str = "cpu", weights_only: bool = False):
+    """
+    Load a PyTorch checkpoint across supported PyTorch versions.
+
+    :param learner_file: Path to the checkpoint file.
+    :param map_location: Device mapping passed to ``torch.load``.
+    :param weights_only: Whether to request PyTorch's restricted checkpoint loader.
+    :returns: The object loaded from ``learner_file``.
+    """
+    try:
+        return torch.load(learner_file, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(learner_file, map_location=map_location)
+
+
+def get_checkpoint_metadata(learner_file: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
+    """
+    Read self-describing DeepOpt metadata from a checkpoint.
+
+    Legacy checkpoints that do not contain ``deepopt_checkpoint`` metadata return
+    ``None``. Checkpoints that contain malformed DeepOpt metadata raise
+    ``ValueError`` so callers can distinguish old files from broken modern files.
+
+    :param learner_file: Path to the checkpoint file saved with ``torch.save``.
+    :param map_location: Device mapping passed to ``torch.load``.
+    :returns: Metadata with schema version, model type, training data, bounds, and config settings, or ``None`` for legacy checkpoints.
+    :raises ValueError: If metadata is present but has an unsupported schema, invalid model type, or missing required fields.
+    """
+    try:
+        checkpoint = _torch_load(learner_file, map_location=map_location, weights_only=True)
+    except Exception:
+        return None
+    if not isinstance(checkpoint, dict) or DEEPOPT_CHECKPOINT_KEY not in checkpoint:
+        return None
+    metadata = checkpoint[DEEPOPT_CHECKPOINT_KEY]
+    if not isinstance(metadata, dict):
+        raise ValueError("DeepOpt checkpoint metadata is malformed.")
+    schema_version = metadata.get("schema_version")
+    if schema_version != DEEPOPT_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported DeepOpt checkpoint schema version {schema_version}. "
+            f"This DeepOpt version supports schema version {DEEPOPT_CHECKPOINT_SCHEMA_VERSION}."
+        )
+    model_type = metadata.get("model_type")
+    if model_type not in {"GP", "delUQ", "nnEnsemble"}:
+        raise ValueError(f"DeepOpt checkpoint metadata has invalid model_type {model_type}.")
+    required_fields = {"training_data", "bounds", "config_settings"}
+    missing_fields = required_fields.difference(metadata)
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise ValueError(f"DeepOpt checkpoint metadata is missing required field(s): {missing}.")
+    training_data = metadata["training_data"]
+    if not isinstance(training_data, dict) or "X" not in training_data or "y" not in training_data:
+        raise ValueError("DeepOpt checkpoint metadata training_data must contain X and y.")
+    return metadata
+
+
+def is_self_describing_checkpoint(learner_file: str) -> bool:
+    """
+    Return whether a checkpoint contains valid DeepOpt metadata.
+
+    :param learner_file: Path to the checkpoint file.
+    :returns: ``True`` if ``get_checkpoint_metadata`` returns metadata, otherwise ``False``.
+    """
+    return get_checkpoint_metadata(learner_file) is not None
+
+
+def _config_settings_from_checkpoint(metadata: Dict[str, Any]) -> ConfigSettings:
+    """
+    Rebuild configuration settings from checkpoint metadata.
+
+    :param metadata: Valid self-describing checkpoint metadata.
+    :returns: A ``ConfigSettings`` object populated from the saved settings.
+    """
+    config_settings = ConfigSettings(metadata["model_type"])
+    config_settings.config_settings.update(metadata.get("config_settings", {}))
+    config_settings.config_file = None
+    return config_settings
+
+
+def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool = False) -> "DeepoptBaseModel":
+    """
+    Load the appropriate DeepOpt wrapper from a self-describing checkpoint.
+
+    :param learner_file: Path to a checkpoint containing ``deepopt_checkpoint`` metadata.
+    :param device: Device requested for the wrapper and underlying model.
+    :param verbose: If ``True``, enable verbose model evaluation output where supported.
+    :returns: A ``GPModel``, ``DelUQModel``, or ``NNEnsembleModel`` initialized from checkpoint metadata.
+    :raises ValueError: If the checkpoint is legacy or has invalid metadata.
+    """
+    metadata = get_checkpoint_metadata(learner_file)
+    if metadata is None:
+        raise ValueError(
+            "Checkpoint does not contain DeepOpt self-describing metadata. Load it using the legacy explicit path: "
+            "construct the appropriate GPModel, DelUQModel, or NNEnsembleModel with data_file, bounds, "
+            "config_settings, and multi_fidelity, then call load_model(...)."
+        )
+    model_classes = {"GP": GPModel, "delUQ": DelUQModel, "nnEnsemble": NNEnsembleModel}
+    config_settings = _config_settings_from_checkpoint(metadata)
+    return model_classes[metadata["model_type"]](
+        config_settings=config_settings,
+        data_file=metadata.get("data_file"),
+        training_data=metadata["training_data"],
+        bounds=metadata["bounds"],
+        multi_fidelity=metadata.get("multi_fidelity", Defaults.multi_fidelity),
+        random_seed=metadata.get("random_seed", Defaults.random_seed),
+        k_folds=metadata.get("k_folds", Defaults.k_folds),
+        target=metadata.get("target", "dy"),
+        device=device,
+        verbose=verbose,
+        learner_file=learner_file,
+    )
+
+
+def load_deepopt_model(learner_file: str, device: str = "auto", verbose: bool = False) -> Type[Model]:
+    """
+    Load the underlying BoTorch-compatible model from a self-describing checkpoint.
+
+    :param learner_file: Path to a checkpoint containing ``deepopt_checkpoint`` metadata.
+    :param device: Device requested for the wrapper and underlying model.
+    :param verbose: If ``True``, enable verbose model evaluation output where supported.
+    :returns: The model returned by the reconstructed wrapper's ``load_model`` method.
+    """
+    wrapper = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
+    return wrapper.load_model(learner_file)
 
 
 class FidelityCostModel(DeterministicModel):
@@ -110,9 +281,9 @@ class DeepoptBaseModel(ABC):
         saved in a dict format since it's necessary for BoTorch. `Default: None`
     """
 
-    data_file: str
-    bounds: np.ndarray
-    config_settings: ConfigSettings
+    data_file: str = None
+    bounds: np.ndarray = None
+    config_settings: ConfigSettings = None
     random_seed: int = Defaults.random_seed
     multi_fidelity: bool = Defaults.multi_fidelity
     num_fidelities: int = None
@@ -126,22 +297,29 @@ class DeepoptBaseModel(ABC):
     target: str = "dy"
     target_fidelities: Dict[int, float] = None
     verbose: bool = False
+    training_data: Dict[str, Any] = None
+    learner_file: str = None
 
     def __post_init__(self) -> None:
-        try:
-            input_data = np.load(self.data_file)
-            self.X_orig = torch.from_numpy(input_data["X"]).float()
-            self.Y_orig = torch.from_numpy(input_data["y"]).float()
-        except ValueError:
-            input_data = np.load(self.data_file,allow_pickle=True)
-            self.X_orig = torch.from_numpy(input_data["X"].astype(np.float32))
-            self.Y_orig = torch.from_numpy(input_data["y"].astype(np.float32))
+        if self.training_data is None:
+            try:
+                input_data = np.load(self.data_file)
+                self.X_orig = torch.from_numpy(input_data["X"]).float()
+                self.Y_orig = torch.from_numpy(input_data["y"]).float()
+            except ValueError:
+                input_data = np.load(self.data_file,allow_pickle=True)
+                self.X_orig = torch.from_numpy(input_data["X"].astype(np.float32))
+                self.Y_orig = torch.from_numpy(input_data["y"].astype(np.float32))
+        else:
+            self.X_orig = torch.as_tensor(self.training_data["X"]).float()
+            self.Y_orig = torch.as_tensor(self.training_data["y"]).float()
         if len(self.Y_orig.shape) == 1:
             self.Y_orig = self.Y_orig.reshape(-1, 1)
-        self.full_train_X = (self.X_orig - self.bounds[0]) / (self.bounds[1] - self.bounds[0])  # both models
+        bounds = torch.as_tensor(self.bounds, dtype=torch.float)
+        self.input_scaler = InputScaler(bounds, multi_fidelity=self.multi_fidelity, fidelity_dim=-1)
+        self.full_train_X = self.input_scaler.transform(self.X_orig)
         if self.multi_fidelity:
-            self.full_train_X[:, -1] = self.X_orig[:, -1].round()
-            self.num_fidelities = int(self.bounds[1, -1]) + 1
+            self.num_fidelities = int(bounds[1, -1]) + 1
         else:
             self.num_fidelities = 1
             
@@ -156,17 +334,48 @@ class DeepoptBaseModel(ABC):
 
         self.full_train_X = self.full_train_X.to(self.device)
         self.full_train_Y = self.Y_orig.clone().to(self.device)
-        self.bounds = torch.tensor(self.bounds,dtype=torch.float,device=self.device)
+        self.bounds = bounds.to(self.device)
+        self.input_scaler.to(self.device)
 
         self.input_dim = self.full_train_X.size(-1)
         self.output_dim = self.full_train_Y.shape[-1]
         assert self.output_dim == 1, "Multi-output models not currently supported."
+        self.output_scaler = OutputScaler(
+            multi_fidelity=self.multi_fidelity,
+            num_fidelities=self.num_fidelities,
+            fidelity_dim=self.input_dim - 1,
+        ).fit(self.full_train_Y, self.full_train_X)
+        self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
         self.target_fidelities = {self.input_dim - 1: self.num_fidelities - 1}
 
         # TODO: when running single fidelity with deluq, should n_epochs be set to 1000?
         torch.manual_seed(self.random_seed)
         np.random.seed(self.random_seed)
         random.seed(self.random_seed)
+
+    def _checkpoint_metadata(self) -> Dict[str, Any]:
+        """
+        Build metadata needed to reload this wrapper without the original CLI inputs.
+
+        :returns: Self-describing checkpoint metadata stored under ``deepopt_checkpoint``.
+        """
+        return {
+            "schema_version": DEEPOPT_CHECKPOINT_SCHEMA_VERSION,
+            "model_type": self.config_settings.get_setting("model_type"),
+            "training_data": {
+                "X": self.X_orig.detach().cpu(),
+                "y": self.Y_orig.detach().cpu(),
+            },
+            "bounds": self.bounds.detach().cpu(),
+            # Save config settings verbatim so optimize-time loading preserves user choices.
+            "config_settings": dict(self.config_settings.config_settings),
+            "random_seed": self.random_seed,
+            "k_folds": self.k_folds,
+            "multi_fidelity": self.multi_fidelity,
+            "num_fidelities": self.num_fidelities,
+            "target": self.target,
+            "data_file": self.data_file,
+        }
 
     @abstractmethod
     def train(self, outfile: str) -> Type[Model]:
@@ -267,6 +476,241 @@ class DeepoptBaseModel(ABC):
         ).eval()
         return input_pertubation
 
+    def _resolve_learner_file(self, learner_file: Optional[str]) -> str:
+        learner_file = learner_file or self.learner_file
+        if learner_file is None:
+            raise ValueError(
+                "No learner_file was provided and this wrapper does not have a checkpoint path. "
+                "Pass learner_file=... or construct the wrapper with load_deepopt_wrapper(...)."
+            )
+        return learner_file
+
+    def _prepare_risk_query_inputs(
+        self,
+        X_query: Optional[torch.Tensor],
+        x_stddev: Union[np.ndarray, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if X_query is None:
+            X_query = self.full_train_X
+        X_query = torch.as_tensor(X_query, dtype=torch.float, device=self.device)
+        if X_query.ndim == 1:
+            X_query = X_query.reshape(1, -1)
+        x_stddev = torch.as_tensor(x_stddev, dtype=torch.float, device=self.device)
+        if X_query.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected X_query last dimension {self.input_dim}, received {X_query.shape[-1]}.")
+        if x_stddev.numel() != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} values for x_stddev, received {x_stddev.numel()}.")
+        return X_query, x_stddev.reshape(-1)
+
+    def _get_scaled_x_stddev(self, x_stddev: torch.Tensor) -> torch.Tensor:
+        x_stddev_scaled = x_stddev / (self.bounds[1] - self.bounds[0])
+        x_stddev_scaled = x_stddev_scaled.clone()
+        if self.multi_fidelity:
+            x_stddev_scaled[-1] = 0
+        return x_stddev_scaled
+
+    def _prepare_risk_evaluation(
+        self,
+        risk_measure: str,
+        risk_level: float,
+        risk_n_deltas: int,
+        x_stddev: torch.Tensor,
+        learner_file: Optional[str],
+    ) -> Tuple[Type[Model], Type[RiskMeasureMCObjective]]:
+        if risk_n_deltas <= 0:
+            raise ValueError("risk_n_deltas must be positive.")
+        model = self.load_model(learner_file=self._resolve_learner_file(learner_file))
+        x_stddev_scaled = self._get_scaled_x_stddev(x_stddev)
+        bounds_scaled = torch.tensor(self.input_dim * [[0, 1]], dtype=torch.float, device=self.device).T
+        if self.multi_fidelity:
+            bounds_scaled[1, -1] = self.num_fidelities - 1
+        risk_objective = self.get_risk_measure_objective(
+            risk_measure=risk_measure,
+            alpha=risk_level,
+            n_w=risk_n_deltas,
+        )
+        if risk_objective is None:
+            raise ValueError(f"Unsupported risk measure {risk_measure}.")
+        model.input_transform = self.get_input_perturbation(
+            risk_n_deltas=risk_n_deltas,
+            bounds=bounds_scaled,
+            X_stddev=x_stddev_scaled,
+        )
+        model.eval()
+        return model, risk_objective
+
+    def _evaluate_risk_measure(
+        self,
+        model: Type[Model],
+        risk_objective: Type[RiskMeasureMCObjective],
+        X_query: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            posterior = model.posterior(X_query.unsqueeze(-2))
+            samples = posterior.rsample().squeeze(0)
+            return risk_objective(samples).squeeze(-1)
+
+    def _get_risk_measure_values(
+        self,
+        risk_measure: str,
+        X_query: Optional[torch.Tensor],
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int,
+        learner_file: Optional[str],
+    ) -> torch.Tensor:
+        X_query, x_stddev = self._prepare_risk_query_inputs(X_query, x_stddev)
+        model, risk_objective = self._prepare_risk_evaluation(
+            risk_measure=risk_measure,
+            risk_level=risk_level,
+            risk_n_deltas=risk_n_deltas,
+            x_stddev=x_stddev,
+            learner_file=learner_file,
+        )
+        return self._evaluate_risk_measure(model, risk_objective, X_query)
+
+    def get_var(
+        self,
+        X_query: Optional[torch.Tensor] = None,
+        *,
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int = 128,
+        learner_file: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Evaluate Value-at-Risk at query points under input perturbations.
+
+        :param X_query: Query inputs in model units. If ``None``, evaluate at the training inputs.
+        :param risk_level: Quantile level between 0 and 1.
+        :param x_stddev: Input standard deviations in original input units, one value per input dimension.
+        :param risk_n_deltas: Number of input perturbations sampled for the risk objective.
+        :param learner_file: Optional checkpoint path; defaults to this wrapper's checkpoint.
+        :returns: VaR values with one value per query point.
+        """
+        return self._get_risk_measure_values("VaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
+
+    def get_cvar(
+        self,
+        X_query: Optional[torch.Tensor] = None,
+        *,
+        risk_level: float,
+        x_stddev: Union[np.ndarray, torch.Tensor],
+        risk_n_deltas: int = 128,
+        learner_file: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Evaluate Conditional Value-at-Risk at query points under input perturbations.
+
+        :param X_query: Query inputs in model units. If ``None``, evaluate at the training inputs.
+        :param risk_level: Tail level between 0 and 1.
+        :param x_stddev: Input standard deviations in original input units, one value per input dimension.
+        :param risk_n_deltas: Number of input perturbations sampled for the risk objective.
+        :param learner_file: Optional checkpoint path; defaults to this wrapper's checkpoint.
+        :returns: CVaR values with one value per query point.
+        """
+        return self._get_risk_measure_values("CVaR", X_query, risk_level, x_stddev, risk_n_deltas, learner_file)
+
+    def _resolve_optimization_settings(
+        self,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
+    ) -> AcquisitionOptimizationSettings:
+        if optimization_settings is not None:
+            return optimization_settings
+        optimization_config = self.config_settings.config_settings.get("optimization", {})
+        if optimization_config is None:
+            optimization_config = {}
+        if not isinstance(optimization_config, dict):
+            raise ValueError("The optimization config section must be a mapping.")
+        profile = optimization_config.get("profile", Defaults.optimization_profile)
+        if profile not in OPTIMIZATION_PROFILES:
+            raise ValueError(f"Unknown optimization profile {profile}. Valid profiles: {sorted(OPTIMIZATION_PROFILES)}")
+        unknown_keys = set(optimization_config).difference(OPTIMIZATION_SETTING_KEYS | {"profile"})
+        if unknown_keys:
+            raise ValueError(f"Unknown optimization setting(s): {sorted(unknown_keys)}")
+        settings = dict(OPTIMIZATION_PROFILES[profile])
+        settings.update({key: value for key, value in optimization_config.items() if key != "profile"})
+        return self._validate_optimization_settings(settings)
+
+    def _validate_optimization_settings(self, settings: Dict[str, Any]) -> AcquisitionOptimizationSettings:
+        positive_int_keys = (
+            "num_restarts_high",
+            "num_restarts_low",
+            "raw_samples_high",
+            "raw_samples_low",
+            "batch_limit_high",
+            "batch_limit_low",
+            "maxiter",
+            "n_fantasies",
+        )
+        for key in positive_int_keys:
+            if isinstance(settings[key], bool) or int(settings[key]) <= 0:
+                raise ValueError(f"optimization.{key} must be a positive integer.")
+            settings[key] = int(settings[key])
+        fraction = float(settings["torch_num_threads_fraction"])
+        if not 0 < fraction <= 1:
+            raise ValueError("optimization.torch_num_threads_fraction must be in (0, 1].")
+        settings["torch_num_threads_fraction"] = fraction
+        torch_num_threads = settings["torch_num_threads"]
+        if torch_num_threads is not None and torch_num_threads != "auto":
+            if isinstance(torch_num_threads, bool) or int(torch_num_threads) <= 0:
+                raise ValueError("optimization.torch_num_threads must be 'auto', null, or a positive integer.")
+            settings["torch_num_threads"] = int(torch_num_threads)
+        torch_num_interop_threads = settings["torch_num_interop_threads"]
+        if torch_num_interop_threads is not None:
+            if isinstance(torch_num_interop_threads, bool) or int(torch_num_interop_threads) <= 0:
+                raise ValueError("optimization.torch_num_interop_threads must be null or a positive integer.")
+            settings["torch_num_interop_threads"] = int(torch_num_interop_threads)
+        return AcquisitionOptimizationSettings(**settings)
+
+    @staticmethod
+    def _available_cpu_count() -> int:
+        if hasattr(os, "sched_getaffinity"):
+            return len(os.sched_getaffinity(0))
+        for env_var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+            value = os.environ.get(env_var)
+            if value:
+                return int(value)
+        return psutil.cpu_count(logical=False) or os.cpu_count() or 1
+
+    @classmethod
+    def _resolve_auto_torch_num_threads(cls, fraction: float) -> int:
+        available_cpus = cls._available_cpu_count()
+        if available_cpus <= 8:
+            return available_cpus
+        return max(1, int(fraction * available_cpus))
+
+    def _configure_torch_threads(self, settings: AcquisitionOptimizationSettings) -> None:
+        if self.device != "cpu":
+            return
+        torch_num_threads = settings.torch_num_threads
+        if torch_num_threads == "auto":
+            if any(os.environ.get(env_var) for env_var in OPTIMIZATION_THREAD_ENV_VARS):
+                torch_num_threads = None
+            else:
+                torch_num_threads = self._resolve_auto_torch_num_threads(settings.torch_num_threads_fraction)
+        if torch_num_threads is not None:
+            torch.set_num_threads(torch_num_threads)
+        if settings.torch_num_interop_threads is not None:
+            try:
+                torch.set_num_interop_threads(settings.torch_num_interop_threads)
+            except RuntimeError as exc:
+                warnings.warn(f"Could not set torch interop threads: {exc}", RuntimeWarning)
+        if self.verbose:
+            print(
+                f"Torch threads: intraop={torch.get_num_threads()}, "
+                f"interop={torch.get_num_interop_threads()}"
+            )
+
+    def _make_acq_options(self, batch_limit: int, maxiter: int) -> Dict[str, int]:
+        return {"batch_limit": batch_limit, "maxiter": maxiter, "seed": self.random_seed}
+
+    def _optimize_acqf(self, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        return optimize_acqf(**kwargs)
+
+    def _optimize_acqf_mixed(self, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        return optimize_acqf_mixed(**kwargs)
+
     def _get_candidates_mf(
         self,
         model: Type[Model],
@@ -275,7 +719,7 @@ class DeepoptBaseModel(ABC):
         fidelity_cost: np.ndarray,
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -303,6 +747,8 @@ class DeepoptBaseModel(ABC):
         :returns: A two element tuple containing a q x d-dim tensor of generated candidates
             and an associated acquisition value.
         """
+        settings = self._resolve_optimization_settings(optimization_settings)
+        n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
         bounds[1, -1] = self.num_fidelities - 1
 
@@ -320,13 +766,13 @@ class DeepoptBaseModel(ABC):
                 values=[self.num_fidelities - 1],
             )
 
-            best_candidate, max_pmean = optimize_acqf(
+            best_candidate, max_pmean = self._optimize_acqf(
                 acq_function=curr_val_acqf,
                 bounds=bounds[:, :-1],
                 q=1,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
-                options={"batch_limit": 10, "maxiter": 200, "seed": self.random_seed},
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
             q-=1
             if q==0:
@@ -360,14 +806,14 @@ class DeepoptBaseModel(ABC):
                     candidate_set=candidate_set,
                     seed=self.random_seed,
                 )
-            candidates, acq_value = optimize_acqf_mixed(
-                q_acq,
+            candidates, acq_value = self._optimize_acqf_mixed(
+                acq_function=q_acq,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
-                options={"seed": self.random_seed},
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
         elif acq_method == "KG":
             if not propose_best:
@@ -381,13 +827,13 @@ class DeepoptBaseModel(ABC):
                     values=[self.num_fidelities - 1],
                 )
 
-                _, max_pmean = optimize_acqf(
+                _, max_pmean = self._optimize_acqf(
                     acq_function=curr_val_acqf,
                     bounds=bounds[:, :-1],
                     q=1,
-                    num_restarts=Defaults.num_restarts_high,
-                    raw_samples=Defaults.raw_samples_high,
-                    options={"batch_limit": 10, "maxiter": 200, "seed": self.random_seed},
+                    num_restarts=settings.num_restarts_high,
+                    raw_samples=settings.raw_samples_high,
+                    options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
                 )
             
 
@@ -401,14 +847,14 @@ class DeepoptBaseModel(ABC):
                 project=self._project,
                 objective=risk_objective,
             )
-            candidates, acq_value = optimize_acqf_mixed(
+            candidates, acq_value = self._optimize_acqf_mixed(
                 acq_function=mfkg_acqf,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
-                num_restarts=Defaults.num_restarts_low,
-                raw_samples=Defaults.raw_samples_low,
-                options={"batch_limit": 5, "maxiter": 200, "seed": self.random_seed},
+                num_restarts=settings.num_restarts_low,
+                raw_samples=settings.raw_samples_low,
+                options=self._make_acq_options(settings.batch_limit_low, settings.maxiter),
             )
         if propose_best:
             best_candidate = torch.concat([best_candidate.reshape(1,-1),(self.num_fidelities-1)*torch.ones(1,1,device=self.device)],axis=1)
@@ -424,7 +870,7 @@ class DeepoptBaseModel(ABC):
         q: int,
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[Any, Any]:
         """
@@ -450,18 +896,21 @@ class DeepoptBaseModel(ABC):
         :returns: A two element tuple containing a q x d-dim tensor of generated candidates
             and an associated acquisition value.
         """
+        settings = self._resolve_optimization_settings(optimization_settings)
+        n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
 
         if propose_best:
-            best_candidate, max_pmean = optimize_acqf(
+            best_candidate, max_pmean = self._optimize_acqf(
                 acq_function=PosteriorMean(
                     model,
                     posterior_transform=ExpectationPosteriorTransform(n_w=risk_n_deltas) if risk_objective else None,
                 ),
                 bounds=bounds,
                 q=1,
-                num_restarts=Defaults.num_restarts_high,
-                raw_samples=Defaults.raw_samples_high,
+                num_restarts=settings.num_restarts_high,
+                raw_samples=settings.raw_samples_high,
+                options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
             )
             q-=1
             if q==0:
@@ -471,10 +920,7 @@ class DeepoptBaseModel(ABC):
                 return candidates, acq_value
 
         if acq_method == "EI":
-            if hasattr(model,'out_scaler') and hasattr(model,'y_max') and hasattr(model,'y_min'):
-                max_y = model.out_scaler(self.full_train_Y.max(),model.y_min,model.y_max).item()
-            else:
-                max_y = self.full_train_Y.max().item()
+            max_y = self.full_train_Y_scaled.max().item()
             q_acq = qExpectedImprovement(model, max_y, objective=risk_objective)
         elif acq_method == "NEI":
             q_acq = qNoisyExpectedImprovement(model, self.full_train_X, objective=risk_objective, prune_baseline=True)
@@ -491,15 +937,16 @@ class DeepoptBaseModel(ABC):
             )
         elif acq_method == "KG":
             if not propose_best:
-                _, max_pmean = optimize_acqf(
+                _, max_pmean = self._optimize_acqf(
                     acq_function=PosteriorMean(
                         model,
                         posterior_transform=ExpectationPosteriorTransform(n_w=risk_n_deltas) if risk_objective else None,
                     ),
                     bounds=bounds,
                     q=1,
-                    num_restarts=Defaults.num_restarts_high,
-                    raw_samples=Defaults.raw_samples_high,
+                    num_restarts=settings.num_restarts_high,
+                    raw_samples=settings.raw_samples_high,
+                    options=self._make_acq_options(settings.batch_limit_high, settings.maxiter),
                 )
             
             q_acq = qKnowledgeGradient(
@@ -510,14 +957,17 @@ class DeepoptBaseModel(ABC):
                 current_value=max_pmean,
                 objective=risk_objective,
             )
-        candidates, acq_value = optimize_acqf(
-            q_acq,
+        candidates, acq_value = self._optimize_acqf(
+            acq_function=q_acq,
             bounds=bounds,
             q=q,
-            num_restarts=Defaults.num_restarts_high,
-            raw_samples=Defaults.raw_samples_low if acq_method in ["MaxValEntropy", "KG"] else Defaults.raw_samples_high,
+            num_restarts=settings.num_restarts_low if acq_method in ["MaxValEntropy", "KG"] else settings.num_restarts_high,
+            raw_samples=settings.raw_samples_low if acq_method in ["MaxValEntropy", "KG"] else settings.raw_samples_high,
             sequential=(acq_method == "MaxValEntropy"),
-            options={"seed": self.random_seed},
+            options=self._make_acq_options(
+                settings.batch_limit_low if acq_method in ["MaxValEntropy", "KG"] else settings.batch_limit_high,
+                settings.maxiter,
+            ),
         )
         if propose_best:
             candidates = torch.concat([best_candidate.reshape(1,-1),candidates],axis=0)
@@ -532,7 +982,7 @@ class DeepoptBaseModel(ABC):
         risk_objective: Optional[Type[RiskMeasureMCObjective]] = None,
         risk_n_deltas: Optional[int] = None,
         fidelity_cost: Optional[np.ndarray] = None,
-        n_fantasies: Optional[int] = Defaults.n_fantasies,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
         propose_best: Optional[bool] = False,
     ) -> Tuple[Any, Any]:
         """
@@ -570,7 +1020,7 @@ class DeepoptBaseModel(ABC):
                 fidelity_cost=fidelity_cost,
                 risk_objective=risk_objective,
                 risk_n_deltas=risk_n_deltas,
-                n_fantasies=n_fantasies,
+                optimization_settings=optimization_settings,
                 propose_best=propose_best,
             )
         else:
@@ -580,7 +1030,7 @@ class DeepoptBaseModel(ABC):
                 q=q,
                 risk_objective=risk_objective,
                 risk_n_deltas=risk_n_deltas,
-                n_fantasies=n_fantasies,
+                optimization_settings=optimization_settings,
                 propose_best=propose_best,
             )
         return candidates, acq_value
@@ -596,9 +1046,9 @@ class DeepoptBaseModel(ABC):
         risk_level: float = None,
         risk_n_deltas: int = None,
         x_stddev: np.ndarray = None,
-        n_fantasies: int = Defaults.n_fantasies,
         propose_best: bool = False,
-        integer_fidelities: bool = False
+        integer_fidelities: bool = False,
+        optimization_settings: Optional[AcquisitionOptimizationSettings] = None,
     ) -> None:
         """
         The function to process the `deepopt optimize` command.
@@ -607,7 +1057,7 @@ class DeepoptBaseModel(ABC):
 
         :param outfile: The name of the file to save the proposed candidates in
         :param learner_file: The name of the checkpoint file produced by `learn`
-        :param acq_method: The acquisiton function. Single-fidelity options:
+        :param acq_method: The acquisition function. Single-fidelity options:
             'KG', 'MaxValEntropy', 'EI', or 'NEI'. Multi-fidelity options: 'KG' or
             'MaxValEntropy'
         :param num_candidates: The number of candidates
@@ -616,15 +1066,15 @@ class DeepoptBaseModel(ABC):
                 or 'VaR' (Value-at-Risk).
         :param risk_level: The risk level (a float between 0 and 1)
         :param risk_n_deltas: The number of input perturbations to sample for X's uncertainty
-        :param x_stddev: Uncertainity in X (stddev) in each dimension
-        :param n_fantasies: Number of fantasies to generate. The higher this number the more accurate
-            the model (at the expense of model complexity and performance).
+        :param x_stddev: Uncertainty in X (stddev) in each dimension
         :param propose_best: If `True`, the first candidate is selected to maximize the surrogate posterior,
             while the rest are acquired by the specified acquisition method. If `False`, acquire all points
             with the acquisition method as usual. 
         :param integer_fidelities: If `True`, converts fidelity column to integers when saving candidate .npy file.
             Saved numpy array had dtype 'object' and requires `allow_pickle=True` option in `np.load` to read.
         """
+        optimization_settings = self._resolve_optimization_settings(optimization_settings)
+        self._configure_torch_threads(optimization_settings)
         print(
             f"""
             Infile: {self.data_file}
@@ -647,6 +1097,7 @@ class DeepoptBaseModel(ABC):
             x_stddev_scaled = x_stddev / (self.bounds[1] - self.bounds[0])
             bounds_scaled = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float).T
             if self.multi_fidelity:
+                bounds_scaled[1, -1] = self.num_fidelities - 1
                 x_stddev_scaled[-1] = 0
             risk_objective = self.get_risk_measure_objective(risk_measure=risk_measure, alpha=risk_level, n_w=risk_n_deltas)
             model.input_transform = self.get_input_perturbation(
@@ -665,7 +1116,7 @@ class DeepoptBaseModel(ABC):
             risk_objective=risk_objective,
             risk_n_deltas=risk_n_deltas,
             fidelity_cost=fidelity_cost,
-            n_fantasies=n_fantasies,
+            optimization_settings=optimization_settings,
             propose_best=propose_best,
         )
         if self.multi_fidelity:
@@ -675,8 +1126,65 @@ class DeepoptBaseModel(ABC):
             candidates = candidates * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         candidates_npy = candidates.cpu().detach().numpy()
         if integer_fidelities and self.multi_fidelity:
+            # Mixed float inputs and integer fidelities require object dtype in the saved array.
             candidates_npy = np.concatenate([candidates_npy[:,:-1].astype(np.float32),candidates_npy[:,-1:].astype(int)],axis=1,dtype='object')
         np.save(outfile, candidates_npy)
+
+
+class DeepOptGPMixin:
+    """
+    Shared prediction API for GP models trained in scaled output units.
+    """
+
+    def get_prediction_with_uncertainty(
+        self,
+        q: torch.Tensor,
+        get_cov: bool = False,
+        *args: Any,
+        original_scale_x: bool = True,
+        original_scale_y: bool = True,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return GP posterior mean and variance or covariance.
+
+        :param q: Query tensor with shape ``... x q x d``.
+        :param get_cov: If ``True``, return the joint ``q x q`` covariance; otherwise return pointwise variance.
+        :param original_scale_x: If ``True``, transform query inputs from original units to model units.
+        :param original_scale_y: If ``True``, transform posterior statistics back to original output units.
+        :returns: ``(mean, variance)`` or ``(mean, covariance)`` depending on ``get_cov``.
+        """
+        reject_deprecated_original_scale(args, kwargs)
+        q_model = q
+        if original_scale_x:
+            if not hasattr(self, "input_scaler") or self.input_scaler is None:
+                raise RuntimeError("original_scale_x=True requires this model to have an input_scaler.")
+            q_model = self.input_scaler.transform(q)
+        posterior = self.posterior(q_model, **kwargs)
+        mean = posterior.mean
+        if get_cov:
+            cov = posterior.mvn.covariance_matrix
+            if original_scale_y:
+                mean = self.output_scaler.inverse_transform(mean, q_model)
+                cov = self.output_scaler.inverse_covariance(cov, q_model)
+            return mean.squeeze(-1), cov
+        variance = posterior.variance
+        if original_scale_y:
+            mean = self.output_scaler.inverse_transform(mean, q_model)
+            variance = self.output_scaler.inverse_variance(variance, q_model)
+        return mean, variance
+
+
+class DeepOptSingleTaskGP(DeepOptGPMixin, SingleTaskGP):
+    """
+    Single-fidelity GP model with DeepOpt prediction scaling helpers.
+    """
+
+
+class DeepOptSingleTaskMultiFidelityGP(DeepOptGPMixin, SingleTaskMultiFidelityGP):
+    """
+    Multi-fidelity GP model with DeepOpt prediction scaling helpers.
+    """
 
 
 class GPModel(DeepoptBaseModel):
@@ -703,21 +1211,28 @@ class GPModel(DeepoptBaseModel):
         mll: ExactMarginalLogLikelihood = None
 
         if self.multi_fidelity:
-            model = SingleTaskMultiFidelityGP(
+            model = DeepOptSingleTaskMultiFidelityGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
                 data_fidelity=self.input_dim - 1,
             )
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
         else:
-            model = SingleTaskGP(self.full_train_X, self.full_train_Y, outcome_transform=Standardize(m=1))
+            model = DeepOptSingleTaskGP(self.full_train_X, self.full_train_Y_scaled)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        model.output_scaler = self.output_scaler
+        model.input_scaler = self.input_scaler
 
         fit_gpytorch_model(mll)
 
-        state = {"state_dict": model.state_dict()}
-        torch.save(state, join(getcwd(), dirname(outfile), basename(outfile)))
+        state = {
+            "state_dict": model.state_dict(),
+            "output_scaler": self.output_scaler.state_dict(),
+            "input_scaler": self.input_scaler.state_dict(),
+            DEEPOPT_CHECKPOINT_KEY: self._checkpoint_metadata(),
+        }
+        self.learner_file = join(getcwd(), dirname(outfile), basename(outfile))
+        torch.save(state, self.learner_file)
         return model
 
     def load_model(self, learner_file: str) -> Union[SingleTaskGP, SingleTaskMultiFidelityGP]:
@@ -731,22 +1246,50 @@ class GPModel(DeepoptBaseModel):
         """
 
         model: Union[SingleTaskGP, SingleTaskMultiFidelityGP] = None
+        state_dict = _torch_load(learner_file, map_location=self.device)
+        model_state = dict(state_dict["state_dict"])
+        if "input_scaler" in state_dict:
+            self.input_scaler = InputScaler.from_state_dict(state_dict["input_scaler"], device=self.device)
+            self.full_train_X = self.input_scaler.transform(self.X_orig).to(self.device)
+        else:
+            self.input_scaler = InputScaler(self.bounds, multi_fidelity=self.multi_fidelity, fidelity_dim=-1).to(self.device)
+            self.full_train_X = self.input_scaler.transform(self.X_orig).to(self.device)
+            warnings.warn(
+                "GP checkpoint has no input_scaler state; reconstructing input scaling from current bounds.",
+                RuntimeWarning,
+            )
+        if "output_scaler" in state_dict:
+            self.output_scaler = OutputScaler.from_state_dict(state_dict["output_scaler"], device=self.device)
+            self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
+        elif any(key.startswith("outcome_transform.") for key in model_state):
+            self.output_scaler = StandardizeOutputScaler.from_botorch_state_dict(model_state, device=self.device)
+            self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
+            model_state = {key: value for key, value in model_state.items() if not key.startswith("outcome_transform.")}
+            warnings.warn(
+                "Loaded legacy GP checkpoint with BoTorch Standardize output scaling; using compatibility "
+                "z-score scaling for predictions.",
+                RuntimeWarning,
+            )
+        else:
+            warnings.warn(
+                "GP checkpoint has no output_scaler state; using scaler fit from the current data file.",
+                RuntimeWarning,
+            )
 
         if self.multi_fidelity:
-            model = SingleTaskMultiFidelityGP(
+            model = DeepOptSingleTaskMultiFidelityGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
                 data_fidelity=self.input_dim - 1,
             )
         else:
-            model = SingleTaskGP(
+            model = DeepOptSingleTaskGP(
                 self.full_train_X,
-                self.full_train_Y,
-                outcome_transform=Standardize(m=1),
+                self.full_train_Y_scaled,
             )
-        state_dict = torch.load(learner_file)
-        model.load_state_dict(state_dict["state_dict"])
+        model.output_scaler = self.output_scaler
+        model.input_scaler = self.input_scaler
+        model.load_state_dict(model_state)
         return model
 
 
@@ -808,6 +1351,8 @@ class DelUQModel(DeepoptBaseModel):
                     y_train=y_train,
                     target=self.target,
                     multi_fidelity=self.multi_fidelity,
+                    output_scaler=self.output_scaler,
+                    input_scaler=self.input_scaler,
                 )
                 model.train()
                 model.fit()
@@ -815,14 +1360,12 @@ class DelUQModel(DeepoptBaseModel):
             model.eval()
             with torch.no_grad():  # TODO: is this needed?
                 for _, (X_test, y_test) in enumerate(test_loader):
-                    if self.multi_fidelity:
-                        test_fid_locs = [X_test[..., -1] == i for i in model.X_train[..., -1].unique()]
-                        y_test_scaled = y_test.clone()
-                        for fid_loc, y_min, y_max in zip(test_fid_locs, model.y_min, model.y_max):
-                            y_test_scaled[fid_loc] = model.out_scaler(y_test_scaled[fid_loc], y_min, y_max)
-                    else:
-                        y_test_scaled = model.out_scaler(y_test, model.y_min, model.y_max)
-                    y_pred, _ = model.get_prediction_with_uncertainty(X_test, original_scale=False)
+                    y_test_scaled = self.output_scaler.transform(y_test, X_test)
+                    y_pred, _ = model.get_prediction_with_uncertainty(
+                        X_test,
+                        original_scale_x=False,
+                        original_scale_y=False,
+                    )
                     cv_score += cv_loss_fun(y_test_scaled, y_pred)
 
         return {"score": cv_score.item()}
@@ -897,6 +1440,8 @@ class DelUQModel(DeepoptBaseModel):
             y_train=self.full_train_Y,
             target=self.target,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
+            input_scaler=self.input_scaler,
         )
 
         model.fit()
@@ -904,7 +1449,8 @@ class DelUQModel(DeepoptBaseModel):
             fname = basename(outfile)[:-5]
         else:
             fname = basename(outfile)
-        model.save_ckpt(join(getcwd(), dirname(outfile)), fname)
+        model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
+        self.learner_file = join(getcwd(), dirname(outfile), f"{fname}.ckpt")
         ray.shutdown()
         return model
 
@@ -933,6 +1479,8 @@ class DelUQModel(DeepoptBaseModel):
             y_train=self.full_train_Y,
             target=self.target,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
+            input_scaler=self.input_scaler,
         )
 
         # DeltaEnc model requries the parent path and file name to be separated.
@@ -947,6 +1495,12 @@ class DelUQModel(DeepoptBaseModel):
         return model
 
 class NNEnsembleModel(DeepoptBaseModel):
+    """
+    DeepOpt wrapper for training, loading, and optimizing NN ensemble surrogates.
+
+    This class has the same class variables as ``DeepoptBaseModel``.
+    """
+
     def train(self, outfile: str) -> Type[Model]:
         """
         Train the NN Ensemble surrogate and save the model produced. 
@@ -976,6 +1530,8 @@ class NNEnsembleModel(DeepoptBaseModel):
             X_train=self.full_train_X,
             y_train=self.full_train_Y,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
+            input_scaler=self.input_scaler,
             verbose=self.verbose,
         )
 
@@ -984,7 +1540,8 @@ class NNEnsembleModel(DeepoptBaseModel):
             fname = basename(outfile)[:-5]
         else:
             fname = basename(outfile)
-        model.save_ckpt(join(getcwd(), dirname(outfile)), fname)
+        model.save_ckpt(join(getcwd(), dirname(outfile)), fname, checkpoint_metadata=self._checkpoint_metadata())
+        self.learner_file = join(getcwd(), dirname(outfile), f"{fname}.ckpt")
         ray.shutdown()
         return model
 
@@ -1013,6 +1570,8 @@ class NNEnsembleModel(DeepoptBaseModel):
             X_train=self.full_train_X,
             y_train=self.full_train_Y,
             multi_fidelity=self.multi_fidelity,
+            output_scaler=self.output_scaler,
+            input_scaler=self.input_scaler,
             verbose=self.verbose
         )
 

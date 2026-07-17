@@ -5,7 +5,7 @@ neural networks.
 import os
 import warnings
 from copy import copy
-from typing import Any, Callable, Tuple, Type, Union
+from typing import Any, Callable, Dict, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -19,6 +19,8 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 from deepopt.configuration import ConfigSettings
+from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
+from deepopt.output_scaling import OutputScaler
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
 
@@ -27,9 +29,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class DeltaEnc(Model):
     """
-    The `DeltaEnc` class represents the single-fidelity Delta UQ model for neural
-    networks. This model will allow us to set the training data, fit it, and get
-    our prediciton values with uncertainty.
+    BoTorch-compatible delta-UQ neural-network model.
+
+    The model stores training inputs in model units and can return predictions in
+    either model units or original output units through ``get_prediction_with_uncertainty``.
+    Checkpoints store network weights, Fourier-feature matrices, optimizer state,
+    output scaler state, optional input scaler state, and optional DeepOpt metadata.
     """
 
     def __init__(
@@ -41,6 +46,8 @@ class DeltaEnc(Model):
         y_train: np.ndarray,
         target: str = "dy",  # 'y', 'dy'
         multi_fidelity: bool = False,
+        output_scaler: OutputScaler = None,
+        input_scaler: InputScaler = None,
     ):
         """
         Initialize an instance of the `DeltaEnc` model for further processing.
@@ -84,27 +91,24 @@ class DeltaEnc(Model):
         self._batch_shape = batch_shape
         self.n_train = X_train.shape[-2]
 
-        self.out_scaler = lambda y, y_min, y_max: (y - y_min) / (y_max - y_min)
-        self.out_scaler_inv = lambda y, y_min, y_max: y * (y_max - y_min) + y_min
+        if output_scaler is None:
+            output_scaler = OutputScaler(
+                multi_fidelity=self.multi_fidelity,
+                num_fidelities=int(X_train[..., -1].max().item()) + 1 if self.multi_fidelity else 1,
+                fidelity_dim=self.input_dim - 1,
+            ).fit(y_train, X_train)
+        self.output_scaler = output_scaler.to(self.device)
+        self.input_scaler = input_scaler.to(self.device) if input_scaler is not None else None
+        self.y_min = self.output_scaler.y_min
+        self.y_max = self.output_scaler.y_max
+        self.out_scaler = lambda y, y_min, y_max: (y - y_min) / torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min))
+        self.out_scaler_inv = lambda y, y_min, y_max: y * torch.where((y_max - y_min).abs() > 0, y_max - y_min, torch.ones_like(y_max - y_min)) + y_min
 
         if self.multi_fidelity:
             self.train_fid_locs = [X_train[..., -1] == i for i in X_train[..., -1].unique()]
-            y_train_by_fid = [y_train[fid_loc] for fid_loc in self.train_fid_locs]
 
-            self.y_max = [Y.max().detach() for Y in y_train_by_fid]
-            self.y_min = [Y.min().detach() for Y in y_train_by_fid]
-
-            self.X_train_scaled = X_train.clone()
-            self.y_train_scaled = y_train.clone()
-
-            for fid_loc, y_min, y_max in zip(self.train_fid_locs, self.y_min, self.y_max):
-                self.y_train_scaled[fid_loc] = self.out_scaler(self.y_train_scaled[fid_loc], y_min, y_max)
-        else:
-            self.y_max = y_train.max().detach()
-            self.y_min = y_train.min().detach()
-
-            self.X_train_scaled = X_train.clone()
-            self.y_train_scaled = self.out_scaler(y_train.clone(), self.y_min, self.y_max)
+        self.X_train_scaled = X_train.clone()
+        self.y_train_scaled = self.output_scaler.transform(y_train.clone(), X_train)
 
         self.X_train_nn = self.X_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
         self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
@@ -122,17 +126,19 @@ class DeltaEnc(Model):
 
     @property
     def batch_shape(self):
+        """Batch shape inferred from the training inputs before ``n x d`` dimensions."""
         return self._batch_shape
 
     @batch_shape.setter
     def batch_shape(self, value):
+        """Set the batch shape used when expanding query tensors."""
         self._batch_shape = value
 
     @property
     def num_outputs(self):
         return self.output_dim
 
-    # coped from model.py
+    # copied from model.py
     # Originally, this method accessed the first dim of self.train_inputs (i.e self.train_inputs[0])
     # because the inputs are assumed to be in batches.
     def _set_transformed_inputs(self) -> None:
@@ -236,29 +242,66 @@ class DeltaEnc(Model):
                     self.f_optimizer.step()
                     avg_loss += f_loss.item() / len(loader)
 
-    def save_ckpt(self, path: str, name: str):
+    def save_ckpt(self, path: str, name: str, checkpoint_metadata: Dict[str, Any] = None):
         """
-        Save a trained model to a checkpoint file
+        Save a trained model to a checkpoint file.
 
-        :param path: The path to the checkpoint file
-        :param name: The name of the checkpoint file
+        :param path: The directory where the checkpoint will be written.
+        :param name: The checkpoint base name, without the ``.ckpt`` suffix.
+        :param checkpoint_metadata: Optional self-describing DeepOpt metadata saved under ``deepopt_checkpoint``.
         """
         state = {"epoch": self.n_epochs}
         state["state_dict"] = self.f_predictor.state_dict()
         state["B"] = self.f_predictor.B
         state["opt_state_dict"] = self.f_optimizer.state_dict()
+        state["output_scaler"] = self.output_scaler.state_dict()
+        if self.input_scaler is not None:
+            state["input_scaler"] = self.input_scaler.state_dict()
+        if checkpoint_metadata is not None:
+            state["deepopt_checkpoint"] = checkpoint_metadata
         filename = path + "/" + name + ".ckpt"
         torch.save(state, filename)
         print("Saved Ckpts")
 
     def load_ckpt(self, path: str, name: str):
         """
-        Load in a trained model from a checkpoint file
+        Load a trained model from a checkpoint file.
 
-        :param path: The path to the checkpoint file
-        :param name: The name of the checkpoint file
+        :param path: The directory containing the checkpoint.
+        :param name: The checkpoint base name, without the ``.ckpt`` suffix.
         """
         saved_state = torch.load(os.path.join(path, name + ".ckpt"), map_location=self.device)
+        if "input_scaler" in saved_state:
+            self.input_scaler = InputScaler.from_state_dict(saved_state["input_scaler"], device=self.device)
+        if "output_scaler" in saved_state:
+            self.output_scaler = OutputScaler.from_state_dict(saved_state["output_scaler"], device=self.device)
+            self.y_min = self.output_scaler.y_min
+            self.y_max = self.output_scaler.y_max
+        else:
+            warnings.warn(
+                "DeltaEnc checkpoint has no output_scaler state; using scaler fit from the current data file.",
+                RuntimeWarning,
+            )
+        metadata = saved_state.get("deepopt_checkpoint")
+        if self.input_scaler is not None and isinstance(metadata, dict) and "training_data" in metadata:
+            training_data = metadata["training_data"]
+            self.X_train = self.input_scaler.transform(training_data["X"]).to(self.device)
+            self.y_train = torch.as_tensor(training_data["y"]).float().to(self.device)
+            if len(self.y_train.shape) == 1:
+                self.y_train = self.y_train.reshape(-1, 1)
+            self.input_dim = self.X_train.shape[-1]
+            self.output_dim = self.y_train.shape[-1]
+            self._batch_shape = self.X_train.shape[:-2]
+            self.n_train = self.X_train.shape[-2]
+            self.train_inputs = (self.X_train,)
+        if self.multi_fidelity:
+            self.train_fid_locs = [self.X_train[..., -1] == i for i in self.X_train[..., -1].unique()]
+        self.X_train_scaled = self.X_train.clone()
+        self.y_train_scaled = self.output_scaler.transform(self.y_train.clone(), self.X_train)
+        self.X_train_nn = self.X_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
+        self.y_train_nn = self.y_train_scaled.moveaxis(-2, 0).reshape(self.n_train, -1)
+        self.nn_input_dim = self.X_train_nn.shape[1]
+        self.nn_output_dim = self.y_train_nn.shape[1]
         self.f_predictor.load_state_dict(saved_state["state_dict"])
         self.f_predictor.B = saved_state["B"]
 
@@ -297,7 +340,7 @@ class DeltaEnc(Model):
         :returns: A GPyTorchPosterior object with information on the posterior we calculated
         """
         # Transformations are applied at evaluation time.
-        # An acquisiton's objective funtion will call
+        # An acquisition's objective function will call
         # the model's posterior.
         X = self.transform_inputs(X)
         mvn = self.forward(X, **kwargs)
@@ -317,36 +360,47 @@ class DeltaEnc(Model):
         """
         use_variances = kwargs.get("use_variances")
         if any([use_variances is None, use_variances is False]):
-            means, covs = self.get_prediction_with_uncertainty(X, get_cov=True, original_scale=False, **kwargs)
+            means, covs = self.get_prediction_with_uncertainty(
+                X,
+                get_cov=True,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             try:
-                return MultivariateNormal(means, covs + 1e-6 * torch.eye(covs.shape[-1]))
+                return MultivariateNormal(means, covs + 1e-6 * torch.eye(covs.shape[-1], device=covs.device))
             except Exception as exc1:
                 print(exc1)
                 print("Trying with stronger regularization (1e-5)")
                 try:
-                    return MultivariateNormal(means, covs + 1e-5 * torch.eye(covs.shape[-1]))
+                    return MultivariateNormal(means, covs + 1e-5 * torch.eye(covs.shape[-1], device=covs.device))
                 except Exception as exc2:
                     print(exc2)
                     print("Trying with even stronger regularization (1e-4)")
                     try:
-                        return MultivariateNormal(means, covs + 1e-4 * torch.eye(covs.shape[-1]))
+                        return MultivariateNormal(means, covs + 1e-4 * torch.eye(covs.shape[-1], device=covs.device))
                     except Exception as exc3:
                         print(exc3)
                         print("Trying with yet stronger regularization (1e-3)")
-                        return MultivariateNormal(means, covs + 1e-3 * torch.eye(covs.shape[-1]))
+                        return MultivariateNormal(means, covs + 1e-3 * torch.eye(covs.shape[-1], device=covs.device))
 
         else:
-            means, variances = self.get_prediction_with_uncertainty(X, **kwargs)
+            means, variances = self.get_prediction_with_uncertainty(
+                X,
+                original_scale_x=False,
+                original_scale_y=False,
+                **kwargs,
+            )
             if means.ndim in (1, 2):
                 means_squeeze, variances_squeeze = means.squeeze(), variances.squeeze()
                 if means_squeeze.ndim == 0:
-                    means_squeeze = torch.Tensor([means_squeeze])
+                    means_squeeze = torch.tensor([means_squeeze], dtype=torch.float, device=means.device)
                 if variances_squeeze.ndim == 0:
-                    variances_squeeze = torch.Tensor([variances_squeeze])
+                    variances_squeeze = torch.tensor([variances_squeeze], dtype=torch.float, device=variances.device)
                 mvn = MultivariateNormal(means_squeeze, torch.diag(variances_squeeze + 1e-6))
             else:
                 covar_diag = variances.squeeze(-1) + 1e-6
-                covars = torch.zeros(*covar_diag.shape, covar_diag.shape[-1])
+                covars = torch.zeros(*covar_diag.shape, covar_diag.shape[-1], device=variances.device)
                 for i in range(covar_diag.shape[-1]):
                     covars[..., i, i] = covar_diag[..., i]
                 mvn = MultivariateNormal(means.squeeze(-1), covars)
@@ -357,20 +411,25 @@ class DeltaEnc(Model):
         self,
         q: torch.Tensor,
         get_cov: bool = False,
-        original_scale: bool = True,
+        *args: Any,
+        original_scale_x: bool = True,
+        original_scale_y: bool = True,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Given a tensor calculate the prediction with uncertainty.
+        Evaluate delta-UQ mean and uncertainty at query points.
 
-        :param q: A tensor with data we'll calculate prediction with uncertainty for
-        :param get_cov: If True, get the covariance. Otherwise, get the variance.
-        :param original_scale: If True, apply an inverse scaling transformation to get the scaled
-            predictions back to the original scale. Otherwise, don't re-scale the predictions.
-
-        :returns: A tuple containing the mean tensor and the variance (or covariance if
-            `get_cov=True`) tensor
+        :param q: Query tensor with shape ``... x q x d``.
+        :param get_cov: If ``True``, return the joint ``q x q`` covariance; otherwise return pointwise variance.
+        :param original_scale_x: If ``True``, transform query inputs from original units to model units.
+        :param original_scale_y: If ``True``, transform predictions back to original output units.
+        :returns: ``(mean, variance)`` or ``(mean, covariance)`` depending on ``get_cov``.
         """
+        reject_deprecated_original_scale(args, kwargs)
+        if original_scale_x:
+            if self.input_scaler is None:
+                raise RuntimeError("original_scale_x=True requires this model to have an input_scaler.")
+            q = self.input_scaler.transform(q)
         orig_input_shape = q.shape
         assert (
             q.shape[-1] == self.input_dim
@@ -396,9 +455,6 @@ class DeltaEnc(Model):
         ), f"Expected tensor to have batch shape matching training batch shape {self.batch_shape}, instead found "
         f"tensor of shape {q.shape}."
         input_shape = q.shape
-        if self.multi_fidelity:
-            test_fid_locs = [q[..., -1] == i for i in self.X_train[..., -1].unique()]
-
         q_move = q.moveaxis(-2, 0)
         samples_shape = q_move.shape[: -len(self.batch_shape) - 1]
 
@@ -427,13 +483,8 @@ class DeltaEnc(Model):
         val = val.reshape(n_ref, *samples_shape, *self.batch_shape, self.output_dim).moveaxis(1, -2)
         assert val.shape[1:-1] == input_shape[:-1], "Something went wrong with reshaping."
 
-        if original_scale:
-            if self.multi_fidelity:
-                all_preds = torch.zeros_like(val)
-                for fid_loc, ymin, ymax in zip(test_fid_locs, self.y_min, self.y_max):
-                    all_preds[:, fid_loc] = self.out_scaler_inv(val[:, fid_loc], ymin, ymax)
-            else:
-                all_preds = self.out_scaler_inv(val, self.y_min, self.y_max)
+        if original_scale_y:
+            all_preds = self.output_scaler.inverse_transform(val, q)
         else:
             all_preds = val
 
@@ -473,7 +524,7 @@ class DeltaEnc(Model):
             post_X = self.posterior(X, **kwargs)
             Y_fantasized = sampler(post_X)
 
-        Y_fantasized = Y_fantasized.detach().clone()
+        Y_fantasized = self.output_scaler.inverse_transform(Y_fantasized.detach().clone(), X)
         num_fantasies = Y_fantasized.shape[0]
         X_clone = X.detach().clone()
 
@@ -526,6 +577,8 @@ class DeltaEnc(Model):
                 y_train=Y_train,
                 target=self.target,
                 multi_fidelity=self.multi_fidelity,
+                output_scaler=self.output_scaler,
+                input_scaler=self.input_scaler,
             )
             if hasattr(self, "input_transform"):
                 fantasy_model.input_transform = self.input_transform

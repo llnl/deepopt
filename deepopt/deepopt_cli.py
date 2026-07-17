@@ -14,7 +14,7 @@ from click.core import iter_params_for_processing
 
 from deepopt.configuration import ConfigSettings
 from deepopt.defaults import Defaults
-from deepopt.models import DelUQModel, GPModel, NNEnsembleModel
+from deepopt.models import DelUQModel, GPModel, NNEnsembleModel, get_checkpoint_metadata, load_deepopt_wrapper
 
 
 def get_deepopt_model(model_type: str) -> Union[GPModel, DelUQModel, NNEnsembleModel]:
@@ -250,7 +250,7 @@ def learn(
     "--infile",
     help="Training data path.",
     type=click.Path(exists=True),
-    required=True,
+    required=False,
 )
 @click.option(
     "-o",
@@ -271,15 +271,15 @@ def learn(
     "--bounds",
     help="Bounds for each input dimension.",
     type=click.STRING,
-    required=True,
+    required=False,
 )
 @click.option(
     "-a",
     "--acq-method",
     help="""
               \b
-              The acquisiton function.
-              [NOTE: Some acquistion functions only work with a specific fidelity.]
+              The acquisition function.
+              [NOTE: Some acquisition functions only work with a specific fidelity.]
               \b
               Single    - [KG|MaxValEntropy|EI|NEI]
               Multi     - [KG|MaxValEntropy]
@@ -340,9 +340,6 @@ def learn(
     type=click.STRING,
     default=Defaults.fidelity_cost,
     show_default=True,
-    cls=ConditionalOption,
-    depends_on="multi_fidelity",
-    equal_to=True,
 )
 @click.option(
     "-v",
@@ -374,17 +371,10 @@ def learn(
 )
 @click.option(
     "--X-stddev",
-    help="Uncertainity in X (stddev) in each dimension. [example: --X-stddev [0.00005]].",
+    help="Uncertainty in X (stddev) in each dimension. [example: --X-stddev [0.00005]].",
     type=click.STRING,
     cls=ConditionalOption,
     depends_on="risk_measure",
-)
-@click.option(
-    "--n-fantasies",
-    help="Number of fantasy models to use.",
-    default=Defaults.n_fantasies,
-    type=click.INT,
-    show_default=True,
 )
 @click.option(
     "--propose-best",
@@ -401,9 +391,6 @@ def learn(
     type=click.BOOL,
     default=False,
     show_default=True,
-    cls=ConditionalOption,
-    depends_on="multi_fidelity",
-    equal_to=True,
 )
 def optimize(
     infile,
@@ -423,36 +410,55 @@ def optimize(
     risk_level,
     risk_n_deltas,
     x_stddev,
-    n_fantasies,
     propose_best,
     integer_fidelities,
 ) -> None:
     """
-    Load in the model created by `learn` and use it to propose new simulation points.
-    """    
-    bounds = np.array(json.loads(bounds),dtype=np.float32).T
+    Load in the model created by ``learn`` and use it to propose new simulation points.
 
-    config_settings = ConfigSettings(model_type, config_file=config_file)
-
-    deepopt_model = get_deepopt_model(model_type)
-
-    model = deepopt_model(
-        config_settings=config_settings,
-        data_file=infile,
-        multi_fidelity=multi_fidelity,
-        random_seed=random_seed,
-        bounds=bounds,
-        device=device,
-        verbose=verbose,
-    )
+    Self-describing checkpoints provide their own training data, bounds, model type,
+    and config settings. Legacy checkpoints still require JSON-encoded ``--bounds``
+    and the original ``--infile``.
+    """
+    checkpoint_metadata = get_checkpoint_metadata(learner_file)
+    if checkpoint_metadata is None:
+        # Legacy checkpoints do not include the data and bounds needed to rebuild a wrapper.
+        if infile is None:
+            raise click.UsageError("Legacy checkpoints require --infile.")
+        if bounds is None:
+            raise click.UsageError("Legacy checkpoints require --bounds.")
+        bounds = np.array(json.loads(bounds),dtype=np.float32).T
+        config_settings = ConfigSettings(model_type, config_file=config_file)
+        deepopt_model = get_deepopt_model(model_type)
+        model = deepopt_model(
+            config_settings=config_settings,
+            data_file=infile,
+            multi_fidelity=multi_fidelity,
+            random_seed=random_seed,
+            bounds=bounds,
+            device=device,
+            verbose=verbose,
+        )
+    else:
+        model = load_deepopt_wrapper(learner_file, device=device, verbose=verbose)
+        if config_file is not None:
+            optimize_config_settings = ConfigSettings(checkpoint_metadata["model_type"], config_file=config_file)
+            if "optimization" in optimize_config_settings:
+                model.config_settings.set_setting(
+                    "optimization",
+                    optimize_config_settings.get_setting("optimization"),
+                )
 
     risk_measure = None if risk_measure == "None" else risk_measure
     if risk_measure:
         # x_stddev = torch.tensor(json.loads(x_stddev),dtype=torch.float,device=device)
         x_stddev = np.array(json.loads(x_stddev),dtype=np.float32)
-    if multi_fidelity:
+    if model.multi_fidelity:
         # fidelity_cost = torch.tensor(json.loads(fidelity_cost),dtype=torch.float,device=device)
         fidelity_cost = np.array(json.loads(fidelity_cost),dtype=np.float32)
+    else:
+        fidelity_cost = None
+        integer_fidelities = False
     model.optimize(
         outfile=outfile,
         learner_file=learner_file,
@@ -463,7 +469,6 @@ def optimize(
         risk_level=risk_level,
         risk_n_deltas=risk_n_deltas,
         x_stddev=x_stddev,
-        n_fantasies=n_fantasies,
         propose_best=propose_best,
         integer_fidelities=integer_fidelities,
     )

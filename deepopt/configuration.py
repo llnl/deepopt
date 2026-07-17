@@ -67,6 +67,9 @@ class ConfigSettings:
                 self.config_settings[required_config_key]
             except KeyError:
                 self.config_settings[required_config_key] = default_config_val
+        if "droupout_prob" in self.config_settings and "dropout_prob" not in self.config_settings:
+            # Preserve the historical default key while exposing the spelling model code reads.
+            self.config_settings["dropout_prob"] = self.config_settings["droupout_prob"]
 
     def load_config(self):
         """
@@ -78,7 +81,7 @@ class ConfigSettings:
                 if self.config_file.endswith(".yaml"):
                     config = yaml.safe_load(file)
                 elif self.config_file.endswith(".json"):
-                    config = json.loads(file)
+                    config = json.load(file)
                 else:
                     raise ValueError(f"The config file {self.config_file} must be either a yaml file or a json file.")
 

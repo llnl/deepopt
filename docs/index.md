@@ -66,7 +66,7 @@ model = model_class(data_file="sims.npz", bounds=bounds, config_settings=cs)  #(
 
 1. Input dimension must match data file (`sims.npz` in this case)
 2. We'll use a GP model for simplicity
-3. The `get_deepopt_model` function will return the appropriate class to use for your `model_type`. If your `model_type` is `GP` this will return a `GPModel` and if your `model_type` is `delUQ` this will return a `DelUQModel`. These models include all the high-level functionality required for the `learn` and `optimize` commands.
+3. The `get_deepopt_model` function will return the appropriate class to use for your `model_type`: `GPModel` for `GP`, `DelUQModel` for `delUQ`, and `NNEnsembleModel` for `nnEnsemble`. These models include all the high-level functionality required for the `learn` and `optimize` commands.
 4. This sets up the model configuration. Since we don't pass a configuration file, the default configuration will be used.
 5. Learning and optimizing will take place within these input bounds
 6. Initialize the GP model
@@ -84,21 +84,26 @@ Next, we'll train a GP surrogate on the data and save the model that's created t
 === "DeepOpt CLI"
 
     ```bash
-    input_dim = 5
-    bounds = ""
-    for i in {1..input_dim-1}; do bounds+="[0,1],"; done
-    bounds+="[0,1]" #(1)
+    bounds="[[0,1],[0,1],[0,1],[0,1],[0,1]]" #(1)
     deepopt learn -i sims.npz -o learner_GP.ckpt -b $bounds
     ```
-    1. Together with the previous 2 lines, this defines the appropriate `bounds` variable to match `input_dim`.
+    1. This defines the appropriate JSON-encoded `bounds` variable to match `input_dim`.
 
-The checkpoint files saved by DeepOpt use `torch.save` under the hood. They are python dictionaries and can be viewed using `torch.load`:
+The checkpoint files saved by DeepOpt use `torch.save` under the hood. They are Python dictionaries and can be viewed using `torch.load`:
 ```py title="view_ckpt.py" linenums="1"
 import torch
+from deepopt.models import get_checkpoint_metadata, load_deepopt_model, load_deepopt_wrapper
+
 model_type = 'GP'
-ckpt = torch.load(f'learner_{model_type}.ckpt')
+learner_file = f'learner_{model_type}.ckpt'
+ckpt = torch.load(learner_file)
 print(ckpt.keys())
+print(get_checkpoint_metadata(learner_file).keys())
+wrapper = load_deepopt_wrapper(learner_file)
+botorch_model = load_deepopt_model(learner_file)
 ```
+
+Modern checkpoints are self-describing: they include the model type, training data, bounds, configuration settings, and scaler metadata needed to reload the wrapper without restating those inputs.
 
 Now that we have a model that's trained, we'll use this model to propose new points using [Expected Improvement (EI)](./user_guide/acquisition_functions.md#ei):
 
@@ -115,7 +120,7 @@ Now that we have a model that's trained, we'll use this model to propose new poi
 === "DeepOpt CLI"
 
     ```bash
-    deepopt optimize -i sims.npz -o suggested_inputs.npy -l learner_GP.ckpt  -b $bounds
+    deepopt optimize -o suggested_inputs.npy -l learner_GP.ckpt -a EI
     ```
 
 If you're using the DeepOpt API, we can now run our script with:
