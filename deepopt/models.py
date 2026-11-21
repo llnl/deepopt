@@ -814,16 +814,16 @@ class DeepoptBaseModel(ABC):
         for key in positive_int_keys + non_negative_int_keys:
             value = settings[key]
             minimum = 1 if key in positive_int_keys else 0
-            if isinstance(value, bool) or int(value) != value or int(value) < minimum:
+            if value is None or isinstance(value, bool) or int(value) != value or int(value) < minimum:
                 kind = "a positive" if minimum == 1 else "a non-negative"
                 raise ValueError(f"optimization.{key} must be {kind} integer.")
             settings[key] = int(value)
         for key in ("sampling_init_halfwidth", "sampling_min_halfwidth", "boltzmann_lambda"):
-            if isinstance(settings[key], bool) or float(settings[key]) <= 0:
+            if settings[key] is None or isinstance(settings[key], bool) or float(settings[key]) <= 0:
                 raise ValueError(f"optimization.{key} must be positive.")
             settings[key] = float(settings[key])
         for key in ("sampling_shrink", "sampling_joint_member_prob"):
-            if isinstance(settings[key], bool) or not 0 < float(settings[key]) <= 1:
+            if settings[key] is None or isinstance(settings[key], bool) or not 0 < float(settings[key]) <= 1:
                 raise ValueError(f"optimization.{key} must be in (0, 1].")
             settings[key] = float(settings[key])
         if settings["sampling_subset_prob"] is not None:
@@ -1509,6 +1509,12 @@ class DeepoptBaseModel(ABC):
     ) -> SampledKnowledgeGradient:
         """Build the gradient-free KG used when ``acq_optimizer`` is not ``'gradient'``."""
         n_fantasies = settings.n_fantasies
+        if getattr(model, "fantasize_refits", False) and n_fantasies > 16:
+            warnings.warn(
+                f"Gradient-free KG refits {n_fantasies} fantasy models per evaluation for this surrogate; consider a "
+                "smaller optimization.n_fantasies (e.g. 8-16) and/or fantasy_n_jobs > 1 to reduce run time.",
+                RuntimeWarning,
+            )
         fixed_features_list = None
         project = None
         if self.multi_fidelity:
@@ -1600,6 +1606,7 @@ class DeepoptBaseModel(ABC):
         :returns: ``(candidates, acq_value)`` in scaled model coordinates.
         """
         settings = self._resolve_optimization_settings(optimization_settings)
+        self._check_gradient_support(model, settings)
         with self._using_optimization_settings(settings):
             return self._get_candidates_mf_impl(
                 model, acq_method, q, fidelity_cost, risk_objective, risk_n_deltas, settings, propose_best,
@@ -1847,6 +1854,7 @@ class DeepoptBaseModel(ABC):
         :returns: ``(candidates, acq_value)`` in scaled model coordinates.
         """
         settings = self._resolve_optimization_settings(optimization_settings)
+        self._check_gradient_support(model, settings)
         with self._using_optimization_settings(settings):
             return self._get_candidates_sf_impl(
                 model, acq_method, q, risk_objective, risk_n_deltas, settings, propose_best, optimization_constraints
@@ -2019,15 +2027,9 @@ class DeepoptBaseModel(ABC):
                 raise NotImplementedError("KG acquisition requires model fantasizing, which TabPFN does not currently support.")
             if acq_method == "MaxValEntropy" and q > 1:
                 raise NotImplementedError("TabPFN MaxValEntropy currently supports only one candidate at a time.")
-        if not getattr(model, "supports_gradients", True):
-            if settings.acq_optimizer == "gradient":
-                raise ValueError(
-                    f"The {model_type} surrogate is not differentiable, so it cannot be used with the gradient-based "
-                    "acquisition optimizer. Choose a gradient-free optimizer with --acq-optimizer sampling or "
-                    "--acq-optimizer boltzmann (config: optimization.acq_optimizer)."
-                )
-            if acq_method == "GIBBON":
-                raise NotImplementedError(f"GIBBON requires a GPyTorch model and is not supported with the {model_type} surrogate.")
+        self._check_gradient_support(model, settings)
+        if not getattr(model, "supports_gradients", True) and acq_method == "GIBBON":
+            raise NotImplementedError(f"GIBBON requires a GPyTorch model and is not supported with the {model_type} surrogate.")
 
         with self._using_optimization_settings(settings):
             return self._dispatch_candidates(
@@ -2040,6 +2042,16 @@ class DeepoptBaseModel(ABC):
                 optimization_settings=settings,
                 propose_best=propose_best,
                 optimization_constraints=optimization_constraints,
+            )
+
+    def _check_gradient_support(self, model: Any, settings: AcquisitionOptimizationSettings) -> None:
+        """Reject the gradient optimizer for non-differentiable surrogates."""
+        if not getattr(model, "supports_gradients", True) and settings.acq_optimizer == "gradient":
+            model_type = self.config_settings.get_setting("model_type")
+            raise ValueError(
+                f"The {model_type} surrogate is not differentiable, so it cannot be used with the gradient-based "
+                "acquisition optimizer. Choose a gradient-free optimizer with --acq-optimizer sampling or "
+                "--acq-optimizer boltzmann (config: optimization.acq_optimizer)."
             )
 
     def _dispatch_candidates(

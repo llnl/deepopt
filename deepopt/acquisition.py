@@ -957,8 +957,9 @@ class SampledKnowledgeGradient(AcquisitionFunction):
     The value function is the posterior mean, the MC expected objective
     (``qSimpleRegret``) when a risk objective is given, and optionally the
     ``project``-ed version for multi-fidelity KG. With a ``cost_aware_utility``
-    the fantasy improvements are cost-weighted as in
-    ``qMultiFidelityKnowledgeGradient``.
+    the fantasy improvements are cost-weighted by the cost of the evaluated
+    candidates only (unlike ``qMultiFidelityKnowledgeGradient``, pending points
+    are not charged, which suits greedy sequential batches).
 
     Adapted from BoTorch's knowledge-gradient implementation (MIT license).
     """

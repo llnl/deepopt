@@ -48,9 +48,9 @@ Runtime requirements include heavy scientific/BO dependencies:
 
 On the environment checked when this file was written:
 
-- Default `python3` (idesign env, torch 1.13) has botorch 0.6.6/gpytorch but an older click; several pre-existing CLI/checkpoint tests fail there (`_opt_prefixes`, `torch.load(weights_only=...)`). Run `PYTHONPATH=.` because another `deepopt` is installed in that env.
-- The reference BoTorch venv is `/usr/WS2/kur1/deepopt_tests/myenv_deepopt_release` (torch 2.7, sklearn 1.6); it lacks pytest, so expose pytest via a `PYTHONPATH` shim (e.g. symlinks to the idesign env's `pytest`, `_pytest`, `pluggy`, `iniconfig`).
-- Run all tests on pdebug, never the login node: `srun -p pdebug -N 1 -A wbronze --exclusive --interactive <script>`; `tests/conftest.py` caps threads to 1.
+- Older environments (torch 1.x, older click) fail several pre-existing CLI/checkpoint tests (`_opt_prefixes`, `torch.load(weights_only=...)`); these are environment issues, not regressions. If another `deepopt` is installed, run with `PYTHONPATH=.`.
+- Validate in an environment with BoTorch 0.6.6, a recent torch (2.x), scikit-learn, and pytest; there all tests pass.
+- On HPC systems run tests on a compute/debug allocation, not a login node; `tests/conftest.py` caps threads to 1.
 
 Do not install missing dependencies unless the user explicitly approves. Follow the global HPC safety rules: no heavy fitting, Ray tuning, multiprocessing, large benchmarks, or BO sweeps on login nodes.
 

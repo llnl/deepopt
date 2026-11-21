@@ -94,6 +94,7 @@ class RandomForestSurrogate(Model):
     """
 
     supports_gradients = False
+    fantasize_refits = True
 
     def __init__(
         self,
@@ -227,10 +228,17 @@ class RandomForestSurrogate(Model):
         n_batch = prod(batch)
         q = X.shape[-2]
         full_batch = torch.broadcast_shapes(X.shape[:-2], batch)
-        lead = full_batch[: len(full_batch) - len(batch)]
-        n_lead = prod(lead)
-        X_exp = X.detach().expand(*full_batch, q, self.input_dim).reshape(n_lead, n_batch, q, self.input_dim)
-        X_np = np.ascontiguousarray(X_exp.permute(1, 0, 2, 3).reshape(n_batch, n_lead * q, self.input_dim).cpu().numpy(), dtype=np.float32)
+        n_full = prod(full_batch)
+        # Forest index of every element of the broadcast batch (handles size-1 model batch dims).
+        forest_index = torch.arange(n_batch).reshape(batch).expand(full_batch).reshape(-1)
+        X_flat = X.detach().expand(*full_batch, q, self.input_dim).reshape(n_full, q, self.input_dim)
+        order = torch.argsort(forest_index, stable=True)
+        counts = torch.bincount(forest_index, minlength=n_batch).tolist()
+        n_lead = n_full // n_batch  # every forest serves the same number of broadcast elements
+        X_np = np.ascontiguousarray(
+            X_flat[order].reshape(n_batch, n_lead * q, self.input_dim).cpu().numpy(), dtype=np.float32
+        )
+        assert all(count == n_lead for count in counts)
         with_leaf = self.variance_mode == "trees+leaf"
         means, roots, diags = [], [], []
         for index, forest in enumerate(self.forests):
@@ -242,10 +250,13 @@ class RandomForestSurrogate(Model):
             roots.append(np.moveaxis(preds - mean, 0, -1) / np.sqrt(n_trees - 1))  # n_lead x q x T
             diags.append(leaf_var.reshape(n_trees, n_lead, q).mean(axis=0) if with_leaf else np.zeros_like(mean))
         n_trees = roots[0].shape[-1]
-        mean = torch.as_tensor(np.stack(means, axis=1), dtype=X.dtype, device=X.device).reshape(*full_batch, q)
-        root = torch.as_tensor(np.stack(roots, axis=1), dtype=X.dtype, device=X.device).reshape(*full_batch, q, n_trees)
-        diag = torch.as_tensor(np.stack(diags, axis=1), dtype=X.dtype, device=X.device).reshape(*full_batch, q)
-        return mean, root, diag
+        inverse = torch.argsort(order)
+
+        def unsort(arrays, tail):
+            stacked = torch.as_tensor(np.stack(arrays, axis=0), dtype=X.dtype, device=X.device)  # n_batch x n_lead x ...
+            return stacked.reshape(n_full, *tail)[inverse.to(X.device)].reshape(*full_batch, *tail)
+
+        return unsort(means, (q,)), unsort(roots, (q, n_trees)), unsort(diags, (q,))
 
     def fantasize(self, X: torch.Tensor, sampler: Any, observation_noise: bool = True, **kwargs: Any) -> "RandomForestSurrogate":
         """

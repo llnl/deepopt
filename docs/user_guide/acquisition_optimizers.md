@@ -35,7 +35,7 @@ Scoped sampling replaces the gradient step with repeated local random search:
 2. For each of `sampling_n_rounds` rounds (default `10`):
     1. Draw `sampling_samples_per_elite` (default `128`) new points in a box around every elite.
     2. Re-select the best `sampling_n_elites` from the elites and all new points combined.
-3. Return the best point. With `batch_mode='joint'`, return the best `q x d` batch.
+3. Return the best point. For joint batches (`batch_mode='joint'`, or `default` with `EI`, `NEI`, or `KG`), the same procedure runs over `q x d` batches and returns the best batch.
 
 Each round, every elite's box shrinks. Its half-width, in unit-cube coordinates, is
 
@@ -92,6 +92,7 @@ The gradient-free optimizers handle constraints by rejection:
 - **Feasibility checks:** infeasible draws are discarded, with oversampling to compensate. Linear inequalities and nonlinear inequalities (`>= 0` feasible) are checked directly.
 - **Linear equalities:** handled by projecting each draw onto the constraint set.
 - **Nonlinear modes:** nonlinear constraints are always enforced; `nonlinear_mode` only affects the gradient optimizer.
+- **Boltzmann with equalities:** projection makes the proposals asymmetric, so with linear equality constraints Boltzmann draws are approximate rather than exact samples of the restricted density.
 - **Infeasible problems:** if no feasible point can be found, DeepOpt raises an error asking you to relax the constraints.
 
 ## Knowledge gradient without gradients
@@ -104,7 +105,8 @@ KG(X) = E_fantasy[ max over S of value_fantasy(x') ] − current best value
 
 - **The inner set `S`:** about `kg_inner_set_size` points (default `1024`). It combines posterior-mean elites from a scoped search, the training inputs, and Sobol points, and is shared by every evaluation. A single batched fantasy model per evaluation is therefore enough.
 - **Refinement:** after the outer search, the best `kg_refine_top` candidates (default `8`) are re-scored with a full scoped search of each fantasy model's value function.
-- **Outer budget:** every KG evaluation requires fantasizing (refitting, for `RF`), so the outer search uses the smaller `kg_raw_samples`, `kg_n_elites`, `kg_samples_per_elite`, and `kg_n_rounds` budgets.
+- **Outer budget:** every KG evaluation requires fantasizing (refitting, for `RF`), so the outer search uses the smaller `kg_raw_samples`, `kg_n_elites`, `kg_samples_per_elite`, and `kg_n_rounds` budgets (Boltzmann rounds are capped by `kg_n_rounds` too).
+- **RF cost:** each KG evaluation refits `n_fantasies` forests. With RF, use a small `n_fantasies` (8–16) and `fantasy_n_jobs > 1` on a compute allocation.
 - **Coverage:** multi-fidelity KG, cost weighting, and risk objectives are supported.
 
 ## Settings reference

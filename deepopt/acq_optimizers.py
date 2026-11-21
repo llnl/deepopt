@@ -139,6 +139,7 @@ class SamplingOptions:
             n_rounds=self.kg_n_rounds,
             boltzmann_population=min(self.boltzmann_population, self.kg_raw_samples),
             boltzmann_defer_budget=min(self.boltzmann_defer_budget, self.kg_raw_samples),
+            boltzmann_n_rounds=max(1, min(self.boltzmann_n_rounds, self.kg_n_rounds)),
         )
 
 
@@ -171,8 +172,8 @@ class SearchSpace:
         self.lb = bounds[0]
         self.ub = bounds[1]
         self.d = bounds.shape[-1]
-        span = self.ub - self.lb
-        self.span = torch.where(span > 0, span, torch.ones_like(span))
+        self.span = self.ub - self.lb
+        self._safe_span = torch.where(self.span > 0, self.span, torch.ones_like(self.span))
         options = list(fixed_features_list) if fixed_features_list else [{}]
         keys = set(options[0])
         if any(set(option) != keys for option in options):
@@ -231,7 +232,7 @@ class SearchSpace:
 
     def to_u(self, x: Tensor) -> Tensor:
         """Map model-coordinate points to unit-cube coordinates."""
-        return ((x - self.lb) / self.span).clamp(0.0, 1.0)
+        return ((x - self.lb) / self._safe_span).clamp(0.0, 1.0)
 
     def option_of(self, x: Tensor) -> Tensor:
         """Return the fixed-feature option index nearest to each point of ``x``."""

@@ -232,3 +232,22 @@ def test_rf_multi_fidelity(rf_mf_data_file, tmp_path, acq_method, q):
     candidates = np.load(outfile)
     assert candidates.shape == (q, D)
     assert set(candidates[:, -1].tolist()) <= {0.0, 1.0}
+
+
+def test_predict_broadcasts_size_one_model_batch():
+    model = make_surrogate()
+    fantasy = model.fantasize(torch.rand(1, 1, D), sampler=make_sobol_qmc_normal_sampler(2, seed=0))
+    assert fantasy.batch_shape == torch.Size([2, 1])
+    X = torch.rand(2, 3, 1, D)
+    posterior = fantasy.posterior(X)
+    assert posterior.mean.shape == (2, 3, 1, 1)
+    # Each column reuses the forest of its fantasy, matching a direct per-point query.
+    direct = fantasy.posterior(X[:, :1]).mean
+    assert torch.allclose(posterior.mean[:, :1], direct)
+
+
+def test_null_sampling_setting_raises_value_error(rf_data_file):
+    wrapper = make_wrapper(rf_data_file)
+    wrapper.config_settings.set_setting("optimization", {"sampling_n_rounds": None})
+    with pytest.raises(ValueError, match="sampling_n_rounds"):
+        wrapper._resolve_optimization_settings()
