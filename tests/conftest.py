@@ -1,8 +1,26 @@
 import json
+import os
 from pathlib import Path
+
+# Keep test runs single-threaded so BLAS/OpenMP/torch do not grab every core on shared nodes.
+for _thread_env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_thread_env_var, "1")
 
 import numpy as np
 import pytest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _single_thread_torch():
+    try:
+        import torch
+    except Exception:
+        yield
+        return
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
 
 
 @pytest.fixture

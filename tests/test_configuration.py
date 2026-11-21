@@ -3,7 +3,16 @@ import json
 import pytest
 
 from deepopt.configuration import ConfigSettings
-from deepopt.defaults import DELUQ_CONFIG, GP_CONFIG, NNENSEMBLE_CONFIG, OPTIMIZATION_PROFILES, TABPFN_CONFIG, Defaults
+from deepopt.defaults import (
+    DELUQ_CONFIG,
+    GP_CONFIG,
+    NNENSEMBLE_CONFIG,
+    OPTIMIZATION_PROFILES,
+    RF_CONFIG,
+    SAMPLING_OPTIMIZATION_SETTINGS,
+    TABPFN_CONFIG,
+    Defaults,
+)
 
 
 def test_config_settings_load_defaults_for_supported_models():
@@ -153,3 +162,36 @@ def test_nnensemble_config_exposes_dropout_prob_compatibility_key():
 
     assert settings.get_setting("droupout_prob") == 0.2
     assert settings.get_setting("dropout_prob") == 0.2
+
+
+def test_rf_default_keys_regression():
+    assert RF_CONFIG == {
+        "n_estimators": 200,
+        "max_depth": None,
+        "min_samples_leaf": 1,
+        "max_features": 1.0,
+        "bootstrap": True,
+        "n_jobs": 1,
+        "variance_mode": "trees",
+        "fantasy_n_jobs": 1,
+    }
+    settings = ConfigSettings("RF")
+    assert settings.get_setting("model_type") == "RF"
+    assert settings.get_setting("n_estimators") == 200
+
+
+def test_sampling_settings_in_every_profile_with_backward_compatible_defaults():
+    for profile in OPTIMIZATION_PROFILES.values():
+        for key, value in SAMPLING_OPTIMIZATION_SETTINGS.items():
+            assert profile[key] == value
+    # Defaults keep the historical gradient optimizer and per-acquisition batch rules.
+    assert SAMPLING_OPTIMIZATION_SETTINGS["acq_optimizer"] == "gradient"
+    assert SAMPLING_OPTIMIZATION_SETTINGS["batch_mode"] == "default"
+    assert Defaults.acq_optimizer == "gradient"
+    assert Defaults.batch_mode == "default"
+    assert SAMPLING_OPTIMIZATION_SETTINGS["sampling_raw_samples"] == 2**14
+    assert SAMPLING_OPTIMIZATION_SETTINGS["sampling_n_elites"] == 128
+    assert SAMPLING_OPTIMIZATION_SETTINGS["sampling_samples_per_elite"] == 128
+    assert SAMPLING_OPTIMIZATION_SETTINGS["sampling_n_rounds"] == 10
+    assert SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_sampler"] == "smc"
+    assert SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_lambda"] == 1.0

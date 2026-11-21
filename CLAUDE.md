@@ -8,7 +8,8 @@ DeepOpt is a scientific Python package for Bayesian optimization, with user-faci
 
 - training surrogate models with `deepopt learn`
 - proposing candidates with `deepopt optimize`
-- GP, delUQ, and nnEnsemble model types
+- GP, delUQ, nnEnsemble, optional TabPFN, and RF (scikit-learn random forest) model types
+- gradient (BoTorch L-BFGS, default), gradient-free scoped `sampling`, and `boltzmann` acquisition optimizers
 - single- and multi-fidelity optimization
 - optional risk-aware candidate generation
 
@@ -25,7 +26,10 @@ Primary public compatibility surfaces are the CLI contracts, config/default beha
   - `deltaenc.py` — delUQ BoTorch-compatible NN model wrapper.
   - `nn_ensemble.py` — NN ensemble BoTorch-compatible model wrapper.
   - `surrogate_utils.py` — MLP layers, Fourier features, optimizer creation.
-  - `acquisition.py` — local MES/GIBBON acquisition implementations adapted from BoTorch.
+  - `acquisition.py` — local MES/GIBBON acquisition implementations adapted from BoTorch, plus `SampledKnowledgeGradient` (gradient-free discrete KG).
+  - `acq_optimizers.py` — torch-only gradient-free optimizers: scoped sampling, Boltzmann (SMC/DEFER/importance), `SearchSpace` constraint handling.
+  - `surrogate_rf.py` — `RandomForestSurrogate` (sklearn; covariance from per-tree predictions; fantasize by refitting).
+  - `surrogate_tabpfn.py` — optional TabPFN surrogate.
 - `docs/` — MkDocs documentation and user examples.
 - `requirements/requirements.txt` — runtime deps.
 - `requirements/dev.txt` — dev deps; currently includes `pytest`.
@@ -44,9 +48,9 @@ Runtime requirements include heavy scientific/BO dependencies:
 
 On the environment checked when this file was written:
 
-- `python3 -m pytest` worked.
-- `pytest` was not on `PATH` as a standalone executable.
-- `botorch`, `gpytorch`, and `ray` were not installed, so tests requiring them skip cleanly.
+- Default `python3` (idesign env, torch 1.13) has botorch 0.6.6/gpytorch but an older click; several pre-existing CLI/checkpoint tests fail there (`_opt_prefixes`, `torch.load(weights_only=...)`). Run `PYTHONPATH=.` because another `deepopt` is installed in that env.
+- The reference BoTorch venv is `/usr/WS2/kur1/deepopt_tests/myenv_deepopt_release` (torch 2.7, sklearn 1.6); it lacks pytest, so expose pytest via a `PYTHONPATH` shim (e.g. symlinks to the idesign env's `pytest`, `_pytest`, `pluggy`, `iniconfig`).
+- Run all tests on pdebug, never the login node: `srun -p pdebug -N 1 -A wbronze --exclusive --interactive <script>`; `tests/conftest.py` caps threads to 1.
 
 Do not install missing dependencies unless the user explicitly approves. Follow the global HPC safety rules: no heavy fitting, Ray tuning, multiprocessing, large benchmarks, or BO sweeps on login nodes.
 
@@ -58,11 +62,7 @@ Default command:
 python3 -m pytest -q
 ```
 
-Expected result in the lightweight environment at creation time:
-
-```text
-19 passed, 4 skipped
-```
+In the reference BoTorch venv all tests pass (one `slow`-marked RF parallel-fantasy test included).
 
 Pytest markers are defined in `pytest.ini`:
 
@@ -74,7 +74,8 @@ Important test files:
 - `tests/test_configuration.py`
   - Config/default behavior.
   - Explicit regression for current `NNENSEMBLE_CONFIG` keys, including the misspelled `droupout_prob` key.
-  - Explicit regression that JSON config loading currently raises `TypeError` because `configuration.py` passes a file object to `json.loads`. If fixing JSON config loading, update this test to expected-success.
+  - JSON config loading is supported (`test_config_settings_loads_json_overrides`).
+  - `RF_CONFIG` and `SAMPLING_OPTIMIZATION_SETTINGS` (shared by all optimization profiles) regressions.
 - `tests/test_cli.py`
   - CLI help, `get_deepopt_model`, conditional options, JSON CLI argument parsing.
   - Uses monkeypatching to avoid real training/optimization.
@@ -88,6 +89,10 @@ Important test files:
 - `tests/test_nn_models.py`
   - NN wrapper initialization and checkpoint format.
   - Skips if BO deps unavailable.
+- `tests/test_acq_optimizers.py`
+  - Torch-only tests of scoped sampling, joint/sequential batches, constraints, Boltzmann samplers, DEFER partition.
+- `tests/test_rf_surrogate.py`
+  - RF posterior/covariance, fantasize, checkpoint refit, gradient guard, tiny end-to-end optimize runs (SF/MF/risk/constraints).
 - `tests/test_acquisition.py`
   - Acquisition API import/signature compatibility.
   - Skips if BO deps unavailable.
@@ -98,7 +103,10 @@ When adding features, prefer adding/adjusting focused tests in these files rathe
 
 Preserve these unless intentionally breaking compatibility:
 
-- Model type strings are exact and user-facing: `"GP"`, `"delUQ"`, `"nnEnsemble"`.
+- Model type strings are exact and user-facing: `"GP"`, `"delUQ"`, `"nnEnsemble"`, `"TabPFN"`, `"RF"` (`DEEPOPT_MODEL_TYPES` in `models.py`).
+- `optimization.acq_optimizer` defaults to `"gradient"` and `batch_mode` to `"default"` (MES sequential, EI/NEI/KG joint); with these defaults the `optimize_acqf` calls must stay identical to earlier releases (regression-tested). The CLI only forwards `acq_optimizer`/`batch_mode` to `optimize` when set.
+- All `_optimize_acqf*` calls route through `DeepoptBaseModel._optimize_acqf`/`_optimize_acqf_mixed`, which dispatch on the settings active for the current `get_candidates` call (`_using_optimization_settings`).
+- Surrogates with `supports_gradients = False` (RF) raise if `acq_optimizer == "gradient"`. RF checkpoints store no forest; `load_model` refits deterministically.
 - CLI command names: `learn`, `optimize`.
 - CLI bounds and list-like numeric inputs are JSON strings parsed with `json.loads`, e.g. `"[[0, 1], [0, 1]]"` and `"[1, 10]"`.
 - `.npz` training files are expected to contain keys `X` and `y`.

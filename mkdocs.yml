@@ -12,6 +12,7 @@ nav:
     - Configuration: "user_guide/configuration.md"
     - Candidate Generation: "user_guide/candidate_generation.md"
     - Acquisition Functions: "user_guide/acquisition_functions.md"
+    - Acquisition Optimizers: "user_guide/acquisition_optimizers.md"
     - Checkpoints and Loading: "user_guide/checkpoints.md"
   - Reference Guide:
     - DeepOpt Reference: "api_reference/index.md"

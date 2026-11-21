@@ -11,7 +11,7 @@ The metadata schema includes:
 | Field | Meaning |
 | ----- | ------- |
 | `schema_version` | DeepOpt checkpoint metadata schema version. |
-| `model_type` | One of `GP`, `delUQ`, `nnEnsemble`, or `TabPFN`. |
+| `model_type` | One of `GP`, `delUQ`, `nnEnsemble`, `TabPFN`, or `RF`. |
 | `training_data` | Dictionary containing `X` and `y` tensors. |
 | `bounds` | Bounds tensor with shape `2 x input_dim`, in original input units. |
 | `config_settings` | Saved DeepOpt configuration settings. |
@@ -104,3 +104,7 @@ Input bounds and scaler state are part of the public checkpoint contract:
 - Per-fidelity output scaling is used when `multi_fidelity=True`.
 
 Prediction helpers such as `get_prediction_with_uncertainty` use `original_scale_x=True` and `original_scale_y=True` by default where supported, so query inputs are interpreted in original input units and returned means/variances are in original output units.
+
+## Random forest checkpoints
+
+`RF` checkpoints store the scalers, configuration, random seed, and training data, but not the fitted forest. On load, DeepOpt refits the forest deterministically from the saved data and `random_seed`, so predictions match the trained model without pickling scikit-learn objects.

@@ -21,7 +21,7 @@ Important options:
 | `-i`, `--infile` | Training data `.npz` file containing `X` and `y`. |
 | `-o`, `--outfile` | Checkpoint path to write. |
 | `-b`, `--bounds` | JSON list of `[lower, upper]` bounds in original input units. |
-| `-m`, `--model-type` | Surrogate type: `GP`, `delUQ`, `nnEnsemble`, or optional `TabPFN`. |
+| `-m`, `--model-type` | Surrogate type: `GP`, `delUQ`, `nnEnsemble`, optional `TabPFN`, or `RF` (random forest). |
 | `-c`, `--config-file` | Optional YAML/JSON config file. |
 | `-r`, `--random-seed` | Random seed for training and candidate generation. |
 | `-k`, `--k-folds` | Number of folds used by delUQ training. |
@@ -44,6 +44,8 @@ Core options:
 | `-o`, `--outfile` | NumPy `.npy` file to write proposed candidates into. |
 | `-a`, `--acq-method` | Acquisition method: `EI`, `NEI`, `KG`, or `MaxValEntropy`. `TabPFN` does not currently support `KG`, and its `MaxValEntropy` path supports only one candidate at a time. |
 | `-q`, `--num-candidates` | Number of candidates to propose. |
+| `--acq-optimizer` | `gradient` (default), `sampling`, or `boltzmann`. `RF` requires `sampling` or `boltzmann`. See [Acquisition Optimizers](acquisition_optimizers.md). |
+| `--batch-mode` | `default`, `sequential`, or `joint` construction of `q > 1` batches. |
 | `-c`, `--config-file` | Optional optimize-time config overrides. |
 | `-r`, `--random-seed` | Random seed for candidate generation when using legacy checkpoints. |
 | `-d`, `--device` | `auto`, `cpu`, `gpu`, or `cuda`. |

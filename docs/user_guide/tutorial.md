@@ -30,7 +30,7 @@ python generate_simulation_inputs.py
 ```
 
 ### Default neural network
-DeepOpt supports three model type strings: `GP` maps to `GPModel`, `delUQ` maps to `DelUQModel`, and `nnEnsemble` maps to `NNEnsembleModel`. This tutorial uses the neural-network ensemble model, so we set `model_type` to `nnEnsemble`.
+DeepOpt supports five model type strings: `GP` maps to `GPModel`, `delUQ` maps to `DelUQModel`, `nnEnsemble` maps to `NNEnsembleModel`, `TabPFN` maps to `TabPFNModel`, and `RF` maps to `RFModel`. This tutorial uses the neural-network ensemble model, so we set `model_type` to `nnEnsemble`.
 
 From here we can either use the DeepOpt API or we can use the DeepOpt CLI.
 

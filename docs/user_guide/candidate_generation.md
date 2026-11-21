@@ -20,6 +20,8 @@ Multi-fidelity optimization supports:
 
 `KG` and entropy-style acquisition functions are more expensive, so DeepOpt uses the lower-budget settings from the resolved optimization profile for those paths. See [Configuration Settings](configuration.md#optimization-settings) for profile and budget settings.
 
+By default, acquisition functions are maximized with BoTorch's gradient-based optimizer. Gradient-free scoped sampling and Boltzmann sampling are available with `--acq-optimizer sampling|boltzmann`, and `--batch-mode` selects sequential or joint batch construction. See [Acquisition Optimizers](acquisition_optimizers.md).
+
 ## Linear constraints
 
 Linear constraints are supplied as JSON lists of `[indices, coefficients, rhs]` entries:

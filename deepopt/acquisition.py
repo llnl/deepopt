@@ -935,3 +935,144 @@ def _sample_max_value_Gumbel(
     max_values = a - b * eps.log().mul(-1.0).log()
 
     return max_values  # num_samples x num_fantasies
+
+
+class SampledKnowledgeGradient(AcquisitionFunction):
+    r"""
+    Gradient-free (discrete) knowledge gradient for sampling-based optimizers.
+
+    BoTorch's ``qKnowledgeGradient`` is one-shot: it jointly optimizes the
+    candidate batch and one inner maximizer per fantasy with gradients. This
+    variant instead estimates
+
+    ``KG(X) = E_fantasy[ max_{x' in S} value_fantasy(x') ] - current_value``
+
+    where ``S`` is a shared discrete inner set (posterior-mean elites, training
+    inputs, and Sobol points), so every evaluation needs only one batched
+    fantasy model and posterior evaluations. ``refine_scores`` re-scores a
+    handful of outer candidates with a full scoped search of each fantasy
+    model's value function, which the sampling optimizer calls on its final
+    elites.
+
+    The value function is the posterior mean, the MC expected objective
+    (``qSimpleRegret``) when a risk objective is given, and optionally the
+    ``project``-ed version for multi-fidelity KG. With a ``cost_aware_utility``
+    the fantasy improvements are cost-weighted as in
+    ``qMultiFidelityKnowledgeGradient``.
+
+    Adapted from BoTorch's knowledge-gradient implementation (MIT license).
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        inner_set: Tensor,
+        sampler: Any,
+        inner_sampler: Any = None,
+        current_value: Optional[Tensor] = None,
+        objective: Optional[Any] = None,
+        posterior_transform: Optional[PosteriorTransform] = None,
+        cost_aware_utility: Optional[CostAwareUtility] = None,
+        project: Optional[Callable[[Tensor], Tensor]] = None,
+        inner_bounds: Optional[Tensor] = None,
+        inner_search: Optional[Callable[[Callable[[Tensor], Tensor], Tensor], Tensor]] = None,
+        eval_batch: int = 64,
+        X_pending: Optional[Tensor] = None,
+    ):
+        """
+        :param model: A fitted model with ``fantasize``.
+        :param inner_set: ``m x d`` points over which each fantasy's value function is maximized.
+        :param sampler: Sampler for fantasy outcomes (its sample count is the number of fantasies).
+        :param inner_sampler: Sampler for the MC value function when ``objective`` is given.
+        :param current_value: Current best value, subtracted from fantasy maxima.
+        :param objective: Optional MC objective (e.g. a risk measure) for the value function.
+        :param posterior_transform: Optional posterior transform for the value function.
+        :param cost_aware_utility: Optional cost-aware utility (multi-fidelity).
+        :param project: Optional projection applied before evaluating the value function (multi-fidelity).
+        :param inner_bounds: Bounds for ``refine_scores`` inner searches.
+        :param inner_search: Callable ``(value_fn, bounds, num_fantasies) -> num_fantasies`` best values, used by
+            ``refine_scores``. ``value_fn`` maps ``num_fantasies x n x d`` points (one search per fantasy) to
+            ``num_fantasies x n`` values.
+        :param eval_batch: Number of outer t-batches fantasized at once.
+        :param X_pending: Optional pending points appended to every evaluated batch.
+        """
+        super().__init__(model=model)
+        self.inner_set = inner_set
+        self.sampler = sampler
+        self.inner_sampler = inner_sampler
+        self.current_value = current_value
+        self.objective = objective
+        self.posterior_transform = posterior_transform
+        self.cost_aware_utility = cost_aware_utility
+        self.project = project
+        self.inner_bounds = inner_bounds
+        self.inner_search = inner_search
+        self.eval_batch = max(1, int(eval_batch))
+        self.cost_sampler = deepcopy(sampler) if cost_aware_utility is not None else None
+        self.set_X_pending(X_pending)
+
+    def _value(self, fantasy_model: Model, X: Tensor) -> Tensor:
+        """Value function at ``... x 1 x d`` points of a fantasy model; returns ``...`` values."""
+        if self.project is not None:
+            X = self.project(X)
+        posterior = fantasy_model.posterior(X, posterior_transform=self.posterior_transform)
+        if self.objective is None:
+            return posterior.mean.squeeze(-1).squeeze(-1)
+        samples = self.inner_sampler(posterior)
+        return self.objective(samples, X=X).mean(dim=0).squeeze(-1)
+
+    def _fantasy(self, X: Tensor) -> Model:
+        if self.X_pending is not None:
+            X = torch.cat([X, match_batch_shape(self.X_pending, X)], dim=-2)
+        return self.model.fantasize(X=X, sampler=self.sampler, observation_noise=True)
+
+    def _finish(self, X: Tensor, values: Tensor) -> Tensor:
+        """Turn ``num_fantasies x b`` fantasy maxima into ``b`` KG values."""
+        if self.current_value is not None:
+            values = values - self.current_value
+        if self.cost_aware_utility is not None:
+            values = self.cost_aware_utility(X=X, deltas=values, sampler=self.cost_sampler)
+        return values.mean(dim=0)
+
+    def forward(self, X: Tensor) -> Tensor:
+        """
+        :param X: ``b x q x d`` candidate batches.
+        :returns: ``b`` KG estimates.
+        """
+        out = []
+        for start in range(0, X.shape[0], self.eval_batch):
+            X_chunk = X[start : start + self.eval_batch]
+            fantasy_model = self._fantasy(X_chunk)  # batch: num_fantasies x b
+            S = self.inner_set.unsqueeze(-2)  # m x 1 x d
+            n_f, b = fantasy_model.batch_shape[0], X_chunk.shape[0]
+            S_exp = S.reshape(-1, 1, 1, 1, S.shape[-1]).expand(-1, n_f, b, 1, S.shape[-1])
+            values = self._value(fantasy_model, S_exp)  # m x num_fantasies x b
+            out.append(self._finish(X_chunk, values.max(dim=0).values))
+        return torch.cat(out)
+
+    def refine_scores(self, X: Tensor) -> Tensor:
+        """
+        Re-score candidates by fully maximizing each fantasy model's value function.
+
+        :param X: ``b x q x d`` candidate batches (``b`` is small).
+        :returns: ``b`` refined KG estimates.
+        """
+        if self.inner_search is None:
+            return self.forward(X)
+        scores = []
+        for index in range(X.shape[0]):
+            X_one = X[index : index + 1]
+            fantasy_model = self._fantasy(X_one)
+            n_f = fantasy_model.batch_shape[0]
+
+            def value_fn(points: Tensor, fantasy_model: Model = fantasy_model) -> Tensor:
+                # points: num_fantasies x n x d (one search per fantasy) -> num_fantasies x n values
+                expanded = points.transpose(0, 1).unsqueeze(-2).unsqueeze(-2)  # n x num_fantasies x 1 x 1 x d
+                return self._value(fantasy_model, expanded).reshape(points.shape[1], -1).T
+
+            best = self.inner_search(value_fn, self.inner_bounds, n_f)  # num_fantasies
+            # The discrete inner set is a lower bound; keep the larger of the two maxima.
+            S = self.inner_set.unsqueeze(0).expand(n_f, *self.inner_set.shape)
+            best = torch.maximum(best, value_fn(S).max(dim=-1).values)
+            scores.append(self._finish(X_one, best.reshape(-1, 1)))
+        return torch.cat(scores)

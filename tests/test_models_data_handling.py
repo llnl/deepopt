@@ -294,6 +294,9 @@ def test_configure_torch_threads_respects_auto_and_explicit(monkeypatch, single_
         device="cpu",
     )
     calls = []
+    # "auto" defers to explicit thread environment variables, which test runners commonly set.
+    for env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "TORCH_NUM_THREADS"):
+        monkeypatch.delenv(env_var, raising=False)
     monkeypatch.setattr(DeepoptBaseModel, "_available_cpu_count", staticmethod(lambda: 100))
     monkeypatch.setattr(torch, "set_num_threads", lambda value: calls.append(("threads", value)))
     monkeypatch.setattr(torch, "set_num_interop_threads", lambda value: calls.append(("interop", value)))
@@ -1134,3 +1137,118 @@ def test_risk_accessors_select_botorch_objectives(monkeypatch, single_fidelity_d
 
 def test_deepopt_base_model_remains_abstract():
     assert bool(getattr(DeepoptBaseModel, "__abstractmethods__"))
+
+
+def _gp_wrapper(data_file, optimization=None):
+    settings = ConfigSettings("GP")
+    if optimization is not None:
+        settings.set_setting("optimization", optimization)
+    bounds = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    return GPModel(data_file=str(data_file), bounds=bounds, config_settings=settings, device="cpu")
+
+
+def test_default_settings_keep_historical_gradient_optimize_acqf_call(monkeypatch, single_fidelity_data_file):
+    wrapper = _gp_wrapper(single_fidelity_data_file)
+    captured = {}
+    monkeypatch.setattr("deepopt.models.qExpectedImprovement", lambda *args, **kwargs: object())
+
+    def fake_optimize_acqf(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2], [0.3, 0.4]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.optimize_acqf", fake_optimize_acqf)
+    monkeypatch.setattr(
+        "deepopt.models.optimize_acqf_gradient_free",
+        lambda *args, **kwargs: pytest.fail("default settings must not use the gradient-free optimizer"),
+    )
+    wrapper._get_candidates_sf(model=object(), acq_method="EI", q=2)
+    assert set(captured) == {"acq_function", "bounds", "q", "num_restarts", "raw_samples", "sequential", "options"}
+    assert captured["sequential"] is False
+    assert captured["num_restarts"] == 32
+    assert captured["raw_samples"] == 8192
+    assert captured["options"] == {"batch_limit": 32, "maxiter": 200, "seed": wrapper.random_seed}
+
+
+@pytest.mark.parametrize(
+    "acq_method,batch_mode,expected",
+    [
+        ("EI", "default", False),
+        ("MaxValEntropy", "default", True),
+        ("EI", "sequential", True),
+        ("NEI", "joint", False),
+        ("MaxValEntropy", "sequential", True),
+    ],
+)
+def test_batch_mode_controls_gradient_sequential_flag(monkeypatch, single_fidelity_data_file, acq_method, batch_mode, expected):
+    wrapper = _gp_wrapper(single_fidelity_data_file, {"batch_mode": batch_mode})
+    captured = {}
+    for name in ("qExpectedImprovement", "qNoisyExpectedImprovement", "qMaxValueEntropy"):
+        monkeypatch.setattr(f"deepopt.models.{name}", lambda *args, **kwargs: object())
+
+    def fake_optimize_acqf(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2], [0.3, 0.4]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.optimize_acqf", fake_optimize_acqf)
+    wrapper._get_candidates_sf(model=object(), acq_method=acq_method, q=2)
+    assert captured["sequential"] is expected
+
+
+def test_joint_batch_mode_rejected_for_max_value_entropy(monkeypatch, single_fidelity_data_file):
+    wrapper = _gp_wrapper(single_fidelity_data_file, {"batch_mode": "joint"})
+    monkeypatch.setattr("deepopt.models.qMaxValueEntropy", lambda *args, **kwargs: object())
+    with pytest.raises(ValueError, match="batch_mode='joint'"):
+        wrapper._get_candidates_sf(model=object(), acq_method="MaxValEntropy", q=2)
+
+
+def test_sampling_optimizer_routes_to_gradient_free(monkeypatch, single_fidelity_data_file):
+    wrapper = _gp_wrapper(single_fidelity_data_file, {"acq_optimizer": "sampling", "sampling_n_rounds": 3})
+    captured = {}
+    monkeypatch.setattr("deepopt.models.qExpectedImprovement", lambda *args, **kwargs: object())
+    monkeypatch.setattr("deepopt.models.optimize_acqf", lambda *a, **k: pytest.fail("gradient optimizer must not run"))
+
+    def fake_gradient_free(**kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.1, 0.2]]), torch.tensor(1.0)
+
+    monkeypatch.setattr("deepopt.models.optimize_acqf_gradient_free", fake_gradient_free)
+    wrapper._get_candidates_sf(model=object(), acq_method="EI", q=1)
+    assert captured["method"] == "sampling"
+    assert captured["options"].n_rounds == 3
+    assert captured["seed"] == wrapper.random_seed
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"acq_optimizer": "lbfgs"}, "acq_optimizer"),
+        ({"batch_mode": "parallel"}, "batch_mode"),
+        ({"boltzmann_sampler": "mcmc"}, "boltzmann_sampler"),
+        ({"sampling_shrink": 1.5}, "sampling_shrink"),
+        ({"sampling_n_elites": 0}, "sampling_n_elites"),
+        ({"boltzmann_lambda": 0}, "boltzmann_lambda"),
+    ],
+)
+def test_invalid_sampling_settings_rejected(single_fidelity_data_file, overrides, match):
+    wrapper = _gp_wrapper(single_fidelity_data_file, overrides)
+    with pytest.raises(ValueError, match=match):
+        wrapper._resolve_optimization_settings()
+
+
+def test_optimize_overrides_take_precedence_over_config(monkeypatch, single_fidelity_data_file, tmp_path):
+    wrapper = _gp_wrapper(single_fidelity_data_file, {"acq_optimizer": "boltzmann"})
+    captured = {}
+    monkeypatch.setattr(wrapper, "load_model", lambda learner_file: torch.nn.Module())
+    monkeypatch.setattr(wrapper, "_configure_torch_threads", lambda settings: None)
+
+    def fake_get_candidates(**kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[0.5, 0.5]]), torch.tensor(1.0)
+
+    monkeypatch.setattr(wrapper, "get_candidates", fake_get_candidates)
+    wrapper.optimize(
+        outfile=str(tmp_path / "c.npy"), learner_file="unused", acq_method="EI", num_candidates=1,
+        acq_optimizer="sampling", batch_mode="sequential",
+    )
+    assert captured["optimization_settings"].acq_optimizer == "sampling"
+    assert captured["optimization_settings"].batch_mode == "sequential"

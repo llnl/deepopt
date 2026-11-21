@@ -111,7 +111,7 @@ def get_deepopt_model(model_type: str) -> Type[Any]:
 
     :returns: A DeepOpt model to use for training/optimizing
     """
-    from deepopt.models import DelUQModel, GPModel, NNEnsembleModel, TabPFNModel
+    from deepopt.models import DelUQModel, GPModel, NNEnsembleModel, RFModel, TabPFNModel
 
     if model_type == "GP":
         deepopt_model = GPModel
@@ -121,8 +121,10 @@ def get_deepopt_model(model_type: str) -> Type[Any]:
         deepopt_model = NNEnsembleModel
     elif model_type == "TabPFN":
         deepopt_model = TabPFNModel
+    elif model_type == "RF":
+        deepopt_model = RFModel
     else:
-        raise ValueError(f"The model type {model_type} is not a valid DeepOpt model. Valid models are 'GP', 'delUQ', 'nnEnsemble', and 'TabPFN'.")
+        raise ValueError(f"The model type {model_type} is not a valid DeepOpt model. Valid models are 'GP', 'delUQ', 'nnEnsemble', 'TabPFN', and 'RF'.")
 
     return deepopt_model
 
@@ -260,7 +262,7 @@ def deepopt_cli():
     help="What kind of surrogate are you using?",
     default=Defaults.model_type,
     show_default=True,
-    type=click.Choice(["GP", "delUQ", "nnEnsemble", "TabPFN"]),
+    type=click.Choice(["GP", "delUQ", "nnEnsemble", "TabPFN", "RF"]),
 )
 @click.option(
     "-c",
@@ -386,7 +388,7 @@ def learn(
     help="What kind of surrogate are you using?",
     show_default=True,
     default=Defaults.model_type,
-    type=click.Choice(["GP", "delUQ", "nnEnsemble", "TabPFN"]),
+    type=click.Choice(["GP", "delUQ", "nnEnsemble", "TabPFN", "RF"]),
 )
 @click.option(
     "-c",
@@ -520,6 +522,23 @@ def learn(
     help="Additional retries after nonlinear constrained optimizer failure warnings. Defaults to optimization.nonlinear_optimization_retries.",
     type=click.IntRange(min=0),
 )
+@click.option(
+    "--acq-optimizer",
+    help="""
+              \b
+              How to optimize the acquisition function. Defaults to optimization.acq_optimizer ('gradient').
+              gradient  - BoTorch multistart L-BFGS (requires a differentiable surrogate)
+              sampling  - gradient-free scoped random search
+              boltzmann - i.i.d. draws from the Boltzmann distribution of the acquisition
+              """,
+    type=click.Choice(["gradient", "sampling", "boltzmann"]),
+)
+@click.option(
+    "--batch-mode",
+    help="How q>1 batches are built: default (MaxValEntropy sequential, others joint), sequential, or joint. "
+    "Defaults to optimization.batch_mode.",
+    type=click.Choice(["default", "sequential", "joint"]),
+)
 def optimize(
     infile,
     outfile,
@@ -547,6 +566,8 @@ def optimize(
     nonlinear_initial_raw_samples,
     nonlinear_initial_max_tries,
     nonlinear_optimization_retries,
+    acq_optimizer,
+    batch_mode,
 ) -> None:
     """
     Load a trained checkpoint and propose new simulation points.
@@ -625,6 +646,12 @@ def optimize(
         propose_best=propose_best,
         integer_fidelities=integer_fidelities,
         optimization_constraints=optimization_constraints,
+        # Only forward optimizer overrides the user set, keeping the historical call signature otherwise.
+        **{
+            key: value
+            for key, value in (("acq_optimizer", acq_optimizer), ("batch_mode", batch_mode))
+            if value is not None
+        },
     )
 
 

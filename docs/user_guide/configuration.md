@@ -4,7 +4,7 @@
 
     Model training hyperparameters are only configurable for `nnEnsemble` and `delUQ` models; GP model training runs as-is. Optimization settings apply to all model types.
 
-DeepOpt supports YAML and JSON configuration files. Model-training settings are merged over model-specific defaults, and candidate-generation settings live under a top-level `optimization:` section. `TabPFN` uses optional TabPFN-specific settings such as `tabpfn_api`, `tabpfn_version`, `max_tokens_per_forward`, and `max_weight`.
+DeepOpt supports YAML and JSON configuration files. Model-training settings are merged over model-specific defaults, and candidate-generation settings live under a top-level `optimization:` section. `TabPFN` uses optional TabPFN-specific settings such as `tabpfn_api`, `tabpfn_version`, `max_tokens_per_forward`, and `max_weight`. `RF` uses the random forest settings described below.
 
 ## The Base Configuration Options
 
@@ -41,6 +41,23 @@ hidden_dim: 256
 n_epochs: 500
 dropout_prob: 0.1
 ```
+
+## Random Forest Settings
+
+The `RF` surrogate wraps scikit-learn's `RandomForestRegressor`. Its posterior mean is the average tree prediction, and the joint covariance of a batch of points is the empirical covariance of the individual tree predictions. `RF` is not differentiable and must be optimized with `--acq-optimizer sampling` or `boltzmann` (see [Acquisition Optimizers](acquisition_optimizers.md)).
+
+| Option | Description | Default |
+| ------ | ----------- | ------- |
+| `n_estimators` | Number of trees (at least 2). | `200` |
+| `max_depth` | Maximum tree depth; `null` grows trees fully. | `null` |
+| `min_samples_leaf` | Minimum training samples per leaf. | `1` |
+| `max_features` | Features considered per split (scikit-learn semantics). | `1.0` |
+| `bootstrap` | Fit each tree on a bootstrap sample. | `True` |
+| `n_jobs` | Threads used when fitting the main forest. | `1` |
+| `variance_mode` | `trees` uses the across-tree covariance only; `trees+leaf` also adds the mean within-leaf target variance on the diagonal (law of total variance, as in SMAC). | `trees` |
+| `fantasy_n_jobs` | Threads used to refit fantasy forests in parallel (KG, sequential MaxValEntropy). | `1` |
+
+Fantasy models are built by refitting a forest on the training data augmented with sampled outcomes, one forest per fantasy.
 
 ## Optimization Settings
 
@@ -116,6 +133,10 @@ optimization:
 ```
 
 See [Candidate Generation](candidate_generation.md#nonlinear-constraints) for nonlinear constraint syntax and limitations.
+
+### Acquisition optimizer settings
+
+`acq_optimizer` (`gradient`, `sampling`, or `boltzmann`) and `batch_mode` (`default`, `sequential`, or `joint`) select how acquisition functions are optimized and how `q > 1` batches are built. The defaults (`gradient`, `default`) reproduce earlier DeepOpt behavior. The `sampling_*`, `boltzmann_*`, and `kg_*` keys configure the gradient-free optimizers; see [Acquisition Optimizers](acquisition_optimizers.md#settings-reference) for the full list. CLI flags `--acq-optimizer` and `--batch-mode` override config values.
 
 ### Validation rules
 

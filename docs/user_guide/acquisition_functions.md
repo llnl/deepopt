@@ -21,9 +21,11 @@ Max Value Entropy selects points to minimize its uncertainty about the optimal v
 | Multi-fidelity optimization | No | No | Yes | Yes |
 | VaR/CVaR risk measures | Yes | Yes | Yes | No |
 | Linear constraints | Yes | Yes | Yes | Yes, with candidate-set filtering |
-| Nonlinear constraints | Yes | Yes | No | Single-fidelity only |
+| Nonlinear constraints | Yes | Yes | Gradient-free optimizers only | Single-fidelity only |
+| `RF` surrogate (gradient-free optimizers) | Yes | Yes | Yes (discrete KG) | Yes |
+| `batch_mode: joint` | Yes | Yes | Yes | No |
 
-`KG` and entropy-style acquisition functions use the lower-budget optimization profile settings because they are more expensive. Entropy acquisitions use a sampled candidate set before continuous optimization. Equality constraints are not supported for these candidate sets; use inequality or nonlinear constraints instead. Nonlinear constraints are not currently supported with KG. For nonlinear constraints, `initialization_only` mode filters optimizer starts but does not guarantee final feasibility. See [Candidate Generation](candidate_generation.md) for constraint syntax, risk options, and `propose_best` behavior.
+`KG` and entropy-style acquisition functions use the lower-budget optimization profile settings because they are more expensive. Entropy acquisitions use a sampled candidate set before continuous optimization. Equality constraints are not supported for these candidate sets; use inequality or nonlinear constraints instead. Nonlinear constraints are not currently supported with gradient-based KG; with `--acq-optimizer sampling|boltzmann`, KG uses a gradient-free discrete knowledge gradient that supports them. GIBBON is not available with the `RF` surrogate. See [Acquisition Optimizers](acquisition_optimizers.md) for the gradient-free optimizers. For nonlinear constraints, `initialization_only` mode filters optimizer starts but does not guarantee final feasibility. See [Candidate Generation](candidate_generation.md) for constraint syntax, risk options, and `propose_best` behavior.
 
 ## Risk measures and input perturbations
 

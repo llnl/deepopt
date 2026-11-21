@@ -7,7 +7,15 @@ pytest.importorskip("botorch")
 pytest.importorskip("gpytorch")
 
 from deepopt.deepopt_cli import deepopt_cli, get_deepopt_model
-from deepopt.models import DEEPOPT_CHECKPOINT_KEY, AcquisitionOptimizationConstraints, DelUQModel, GPModel, NNEnsembleModel, TabPFNModel
+from deepopt.models import (
+    DEEPOPT_CHECKPOINT_KEY,
+    AcquisitionOptimizationConstraints,
+    DelUQModel,
+    GPModel,
+    NNEnsembleModel,
+    RFModel,
+    TabPFNModel,
+)
 
 pytestmark = pytest.mark.requires_botorch
 
@@ -17,6 +25,7 @@ def test_get_deepopt_model_supported_names():
     assert get_deepopt_model("delUQ") is DelUQModel
     assert get_deepopt_model("nnEnsemble") is NNEnsembleModel
     assert get_deepopt_model("TabPFN") is TabPFNModel
+    assert get_deepopt_model("RF") is RFModel
 
 
 def test_get_deepopt_model_rejects_invalid_name():
@@ -39,6 +48,7 @@ def test_cli_help_lists_commands_and_core_options():
     assert "--bounds" in result.output
     assert "--model-type" in result.output
     assert "TabPFN" in result.output
+    assert "RF" in result.output
 
     result = runner.invoke(deepopt_cli, ["optimize", "--help"])
     assert result.exit_code == 0
@@ -46,6 +56,8 @@ def test_cli_help_lists_commands_and_core_options():
     assert "--acq-method" in result.output
     assert "--risk-measure" in result.output
     assert "--n-fantasies" not in result.output
+    assert "--acq-optimizer" in result.output
+    assert "--batch-mode" in result.output
 
 
 def test_learn_cli_parses_bounds_and_invokes_model(monkeypatch, single_fidelity_data_file, tmp_path):
@@ -512,3 +524,39 @@ def test_risk_cli_parses_x_stddev_when_risk_measure_used(
     assert kwargs["risk_level"] == 0.5
     assert kwargs["risk_n_deltas"] == 4
     np.testing.assert_allclose(kwargs["x_stddev"], np.array([0.1, 0.2], dtype=np.float32))
+
+
+def _run_optimize_cli(monkeypatch, single_fidelity_data_file, tmp_path, extra_args):
+    learner_file = tmp_path / "learner.ckpt"
+    learner_file.write_text("placeholder")
+    calls = []
+    monkeypatch.setattr(GPModel, "optimize", lambda self, **kwargs: calls.append(kwargs))
+    result = CliRunner().invoke(
+        deepopt_cli,
+        [
+            "optimize",
+            "-i", str(single_fidelity_data_file),
+            "-o", str(tmp_path / "suggested.npy"),
+            "-l", str(learner_file),
+            "-b", "[[0, 1], [0, 1]]",
+            "-a", "EI",
+            "--device", "cpu",
+            *extra_args,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return calls[0]
+
+
+def test_optimize_cli_forwards_acq_optimizer_and_batch_mode(monkeypatch, single_fidelity_data_file, tmp_path):
+    kwargs = _run_optimize_cli(
+        monkeypatch, single_fidelity_data_file, tmp_path, ["--acq-optimizer", "boltzmann", "--batch-mode", "sequential"]
+    )
+    assert kwargs["acq_optimizer"] == "boltzmann"
+    assert kwargs["batch_mode"] == "sequential"
+
+
+def test_optimize_cli_omits_optimizer_overrides_by_default(monkeypatch, single_fidelity_data_file, tmp_path):
+    kwargs = _run_optimize_cli(monkeypatch, single_fidelity_data_file, tmp_path, [])
+    assert "acq_optimizer" not in kwargs
+    assert "batch_mode" not in kwargs

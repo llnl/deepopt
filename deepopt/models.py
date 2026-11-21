@@ -8,6 +8,7 @@ import os
 import random
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from os import getcwd
 from os.path import basename, dirname, join
@@ -36,13 +37,31 @@ from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikeliho
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, SubsetRandomSampler, TensorDataset
 
-from deepopt.acquisition import qMaxValueEntropy, qMultiFidelityLowerBoundMaxValueEntropy, qMultiFidelityMaxValueEntropy
+from deepopt.acq_optimizers import (
+    ACQ_OPTIMIZERS,
+    BATCH_MODES,
+    BOLTZMANN_SAMPLERS,
+    SAMPLING_PERTURBATIONS,
+    SamplingOptions,
+    SearchSpace,
+    batched_max_search,
+    draw_feasible_points,
+    optimize_acqf_gradient_free,
+    search_elites,
+)
+from deepopt.acquisition import (
+    SampledKnowledgeGradient,
+    qMaxValueEntropy,
+    qMultiFidelityLowerBoundMaxValueEntropy,
+    qMultiFidelityMaxValueEntropy,
+)
 from deepopt.configuration import ConfigSettings
-from deepopt.defaults import Defaults, OPTIMIZATION_PROFILES
+from deepopt.defaults import Defaults, OPTIMIZATION_PROFILES, SAMPLING_OPTIMIZATION_SETTINGS
 from deepopt.deltaenc import DeltaEnc
 from deepopt.input_scaling import InputScaler, reject_deprecated_original_scale
 from deepopt.nn_ensemble import NNEnsemble
 from deepopt.output_scaling import OutputScaler, StandardizeOutputScaler
+from deepopt.surrogate_rf import RandomForestSurrogate
 from deepopt.surrogate_tabpfn import TabPFN
 from deepopt.surrogate_utils import MLP as Arch
 from deepopt.surrogate_utils import create_optimizer
@@ -50,6 +69,7 @@ from deepopt.surrogate_utils import create_optimizer
 
 DEEPOPT_CHECKPOINT_KEY = "deepopt_checkpoint"
 DEEPOPT_CHECKPOINT_SCHEMA_VERSION = 1
+DEEPOPT_MODEL_TYPES = ("GP", "delUQ", "nnEnsemble", "TabPFN", "RF")
 OPTIMIZATION_SETTING_KEYS = frozenset(next(iter(OPTIMIZATION_PROFILES.values())).keys())
 OPTIMIZATION_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "TORCH_NUM_THREADS")
 
@@ -78,6 +98,16 @@ class AcquisitionOptimizationSettings:
     :cvar nonlinear_initial_raw_samples: Optional raw sample count for nonlinear-feasible starts.
     :cvar nonlinear_initial_max_tries: Number of attempts to find nonlinear-feasible starts.
     :cvar nonlinear_optimization_retries: Additional retries after optimizer failure warnings.
+    :cvar acq_optimizer: ``'gradient'`` (BoTorch multistart L-BFGS, the default), ``'sampling'``
+        (gradient-free scoped random search), or ``'boltzmann'`` (i.i.d. draws from the Boltzmann
+        distribution of the acquisition function).
+    :cvar batch_mode: ``'default'`` (MaxValEntropy sequential; EI/NEI/KG joint), ``'sequential'``
+        (greedy with pending points), or ``'joint'`` (optimize the q-batch jointly; EI/NEI/KG only).
+        Ignored by ``'boltzmann'``, which always draws i.i.d. points.
+    :cvar sampling_*: Scoped-search budgets and box schedule (see the acquisition optimizer docs).
+    :cvar boltzmann_*: Boltzmann sampler choice (``'smc'``, ``'defer'``, ``'importance'``),
+        inverse temperature, and budgets.
+    :cvar kg_*: Gradient-free KG inner-set size, refinement count, and outer search budget.
     """
 
     num_restarts_high: int
@@ -95,6 +125,31 @@ class AcquisitionOptimizationSettings:
     nonlinear_initial_raw_samples: Optional[int] = Defaults.nonlinear_initial_raw_samples
     nonlinear_initial_max_tries: int = Defaults.nonlinear_initial_max_tries
     nonlinear_optimization_retries: int = Defaults.nonlinear_optimization_retries
+    acq_optimizer: str = SAMPLING_OPTIMIZATION_SETTINGS["acq_optimizer"]
+    batch_mode: str = SAMPLING_OPTIMIZATION_SETTINGS["batch_mode"]
+    sampling_raw_samples: int = SAMPLING_OPTIMIZATION_SETTINGS["sampling_raw_samples"]
+    sampling_n_elites: int = SAMPLING_OPTIMIZATION_SETTINGS["sampling_n_elites"]
+    sampling_samples_per_elite: int = SAMPLING_OPTIMIZATION_SETTINGS["sampling_samples_per_elite"]
+    sampling_n_rounds: int = SAMPLING_OPTIMIZATION_SETTINGS["sampling_n_rounds"]
+    sampling_init_halfwidth: float = SAMPLING_OPTIMIZATION_SETTINGS["sampling_init_halfwidth"]
+    sampling_shrink: float = SAMPLING_OPTIMIZATION_SETTINGS["sampling_shrink"]
+    sampling_min_halfwidth: float = SAMPLING_OPTIMIZATION_SETTINGS["sampling_min_halfwidth"]
+    sampling_perturbation: str = SAMPLING_OPTIMIZATION_SETTINGS["sampling_perturbation"]
+    sampling_subset_prob: Optional[float] = SAMPLING_OPTIMIZATION_SETTINGS["sampling_subset_prob"]
+    sampling_eval_batch: int = SAMPLING_OPTIMIZATION_SETTINGS["sampling_eval_batch"]
+    sampling_joint_member_prob: float = SAMPLING_OPTIMIZATION_SETTINGS["sampling_joint_member_prob"]
+    boltzmann_sampler: str = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_sampler"]
+    boltzmann_lambda: float = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_lambda"]
+    boltzmann_population: int = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_population"]
+    boltzmann_n_rounds: int = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_n_rounds"]
+    boltzmann_mh_steps: int = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_mh_steps"]
+    boltzmann_defer_budget: int = SAMPLING_OPTIMIZATION_SETTINGS["boltzmann_defer_budget"]
+    kg_inner_set_size: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_inner_set_size"]
+    kg_refine_top: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_refine_top"]
+    kg_raw_samples: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_raw_samples"]
+    kg_n_elites: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_n_elites"]
+    kg_samples_per_elite: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_samples_per_elite"]
+    kg_n_rounds: int = SAMPLING_OPTIMIZATION_SETTINGS["kg_n_rounds"]
 
 
 @dataclass(frozen=True)
@@ -178,7 +233,7 @@ def get_checkpoint_metadata(learner_file: str, map_location: str = "cpu") -> Opt
             f"This DeepOpt version supports schema version {DEEPOPT_CHECKPOINT_SCHEMA_VERSION}."
         )
     model_type = metadata.get("model_type")
-    if model_type not in {"GP", "delUQ", "nnEnsemble", "TabPFN"}:
+    if model_type not in DEEPOPT_MODEL_TYPES:
         raise ValueError(f"DeepOpt checkpoint metadata has invalid model_type {model_type}.")
     required_fields = {"training_data", "bounds", "config_settings"}
     missing_fields = required_fields.difference(metadata)
@@ -221,17 +276,17 @@ def load_deepopt_wrapper(learner_file: str, device: str = "auto", verbose: bool 
     :param learner_file: Path to a checkpoint containing ``deepopt_checkpoint`` metadata.
     :param device: Device requested for the wrapper and underlying model.
     :param verbose: If ``True``, enable verbose model evaluation output where supported.
-    :returns: A ``GPModel``, ``DelUQModel``, ``NNEnsembleModel``, or ``TabPFNModel`` initialized from checkpoint metadata.
+    :returns: A ``GPModel``, ``DelUQModel``, ``NNEnsembleModel``, ``TabPFNModel``, or ``RFModel`` initialized from checkpoint metadata.
     :raises ValueError: If the checkpoint is legacy or has invalid metadata.
     """
     metadata = get_checkpoint_metadata(learner_file)
     if metadata is None:
         raise ValueError(
             "Checkpoint does not contain DeepOpt self-describing metadata. Load it using the legacy explicit path: "
-            "construct the appropriate GPModel, DelUQModel, NNEnsembleModel, or TabPFNModel with data_file, bounds, "
+            "construct the appropriate GPModel, DelUQModel, NNEnsembleModel, TabPFNModel, or RFModel with data_file, bounds, "
             "config_settings, and multi_fidelity, then call load_model(...)."
         )
-    model_classes = {"GP": GPModel, "delUQ": DelUQModel, "nnEnsemble": NNEnsembleModel, "TabPFN": TabPFNModel}
+    model_classes = {"GP": GPModel, "delUQ": DelUQModel, "nnEnsemble": NNEnsembleModel, "TabPFN": TabPFNModel, "RF": RFModel}
     config_settings = _config_settings_from_checkpoint(metadata)
     return model_classes[metadata["model_type"]](
         config_settings=config_settings,
@@ -727,7 +782,55 @@ class DeepoptBaseModel(ABC):
             if isinstance(torch_num_interop_threads, bool) or int(torch_num_interop_threads) <= 0:
                 raise ValueError("optimization.torch_num_interop_threads must be null or a positive integer.")
             settings["torch_num_interop_threads"] = int(torch_num_interop_threads)
+        self._validate_sampling_settings(settings)
         return AcquisitionOptimizationSettings(**settings)
+
+    @staticmethod
+    def _validate_sampling_settings(settings: Dict[str, Any]) -> None:
+        """Validate and coerce gradient-free acquisition optimizer settings in place."""
+        choices = {
+            "acq_optimizer": ACQ_OPTIMIZERS,
+            "batch_mode": BATCH_MODES,
+            "sampling_perturbation": SAMPLING_PERTURBATIONS,
+            "boltzmann_sampler": BOLTZMANN_SAMPLERS,
+        }
+        for key, allowed in choices.items():
+            if settings[key] not in allowed:
+                raise ValueError(f"optimization.{key} must be one of {list(allowed)}, got {settings[key]!r}.")
+        positive_int_keys = (
+            "sampling_raw_samples",
+            "sampling_n_elites",
+            "sampling_samples_per_elite",
+            "sampling_eval_batch",
+            "boltzmann_population",
+            "boltzmann_n_rounds",
+            "boltzmann_defer_budget",
+            "kg_inner_set_size",
+            "kg_raw_samples",
+            "kg_n_elites",
+            "kg_samples_per_elite",
+        )
+        non_negative_int_keys = ("sampling_n_rounds", "boltzmann_mh_steps", "kg_refine_top", "kg_n_rounds")
+        for key in positive_int_keys + non_negative_int_keys:
+            value = settings[key]
+            minimum = 1 if key in positive_int_keys else 0
+            if isinstance(value, bool) or int(value) != value or int(value) < minimum:
+                kind = "a positive" if minimum == 1 else "a non-negative"
+                raise ValueError(f"optimization.{key} must be {kind} integer.")
+            settings[key] = int(value)
+        for key in ("sampling_init_halfwidth", "sampling_min_halfwidth", "boltzmann_lambda"):
+            if isinstance(settings[key], bool) or float(settings[key]) <= 0:
+                raise ValueError(f"optimization.{key} must be positive.")
+            settings[key] = float(settings[key])
+        for key in ("sampling_shrink", "sampling_joint_member_prob"):
+            if isinstance(settings[key], bool) or not 0 < float(settings[key]) <= 1:
+                raise ValueError(f"optimization.{key} must be in (0, 1].")
+            settings[key] = float(settings[key])
+        if settings["sampling_subset_prob"] is not None:
+            value = settings["sampling_subset_prob"]
+            if isinstance(value, bool) or not 0 < float(value) <= 1:
+                raise ValueError("optimization.sampling_subset_prob must be null or in (0, 1].")
+            settings["sampling_subset_prob"] = float(value)
 
     @staticmethod
     def _available_cpu_count() -> int:
@@ -772,10 +875,79 @@ class DeepoptBaseModel(ABC):
         return {"batch_limit": batch_limit, "maxiter": maxiter, "seed": self.random_seed}
 
     def _optimize_acqf(self, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
-        return optimize_acqf(**kwargs)
+        if self._active_acq_optimizer() == "gradient":
+            return optimize_acqf(**kwargs)
+        return self._optimize_acqf_gradient_free(**kwargs)
 
     def _optimize_acqf_mixed(self, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
-        return optimize_acqf_mixed(**kwargs)
+        if self._active_acq_optimizer() == "gradient":
+            return optimize_acqf_mixed(**kwargs)
+        return self._optimize_acqf_gradient_free(**kwargs)
+
+    @contextmanager
+    def _using_optimization_settings(self, settings: AcquisitionOptimizationSettings):
+        """Make ``settings`` visible to ``_optimize_acqf`` for the duration of one candidate generation call."""
+        previous = getattr(self, "_active_optimization_settings", None)
+        self._active_optimization_settings = settings
+        try:
+            yield settings
+        finally:
+            self._active_optimization_settings = previous
+
+    def _active_acq_optimizer(self) -> str:
+        """The acquisition optimizer for the candidate generation call in progress."""
+        settings = getattr(self, "_active_optimization_settings", None)
+        return settings.acq_optimizer if settings is not None else "gradient"
+
+    def _optimize_acqf_gradient_free(
+        self,
+        acq_function: Any,
+        bounds: torch.Tensor,
+        q: int,
+        num_restarts: Optional[int] = None,
+        raw_samples: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+        sequential: bool = False,
+        fixed_features: Optional[Dict[int, float]] = None,
+        fixed_features_list: Optional[List[Dict[int, float]]] = None,
+        inequality_constraints: Optional[List[Tuple[torch.Tensor, torch.Tensor, float]]] = None,
+        equality_constraints: Optional[List[Tuple[torch.Tensor, torch.Tensor, float]]] = None,
+        nonlinear_inequality_constraints: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None,
+        post_processing_func: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        batch_initial_conditions: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gradient-free replacement for ``optimize_acqf``/``optimize_acqf_mixed``.
+
+        ``num_restarts``, ``raw_samples``, and the scipy ``options`` of the gradient
+        path are ignored; budgets come from the ``sampling_*``/``boltzmann_*``/``kg_*``
+        optimization settings.
+        """
+        settings = self._active_optimization_settings
+        sampling_options = SamplingOptions.from_settings(settings)
+        if isinstance(acq_function, SampledKnowledgeGradient):
+            sampling_options = sampling_options.for_kg_outer()
+        seed = (options or {}).get("seed", self.random_seed)
+        if fixed_features is not None:
+            if fixed_features_list is not None:
+                raise ValueError("Pass fixed_features or fixed_features_list, not both.")
+            fixed_features_list = [fixed_features]
+        return optimize_acqf_gradient_free(
+            acq_function=acq_function,
+            bounds=bounds,
+            q=q,
+            method=settings.acq_optimizer,
+            options=sampling_options,
+            sequential=sequential,
+            seed=seed,
+            fixed_features_list=fixed_features_list,
+            inequality_constraints=inequality_constraints,
+            equality_constraints=equality_constraints,
+            nonlinear_inequality_constraints=nonlinear_inequality_constraints,
+            post_processing_func=post_processing_func,
+            batch_initial_conditions=batch_initial_conditions,
+        )
 
     def _normalize_optimization_constraints(
         self,
@@ -1116,6 +1288,12 @@ class DeepoptBaseModel(ABC):
         optimization_constraints: Optional[AcquisitionOptimizationConstraints] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._active_acq_optimizer() != "gradient":
+            # Gradient-free optimizers reject infeasible draws directly, including nonlinear constraints.
+            return self._optimize_acqf(**kwargs, **self._optimization_constraint_kwargs(optimization_constraints))
+        if kwargs.get("sequential", False) and kwargs["q"] > 1 and isinstance(kwargs["acq_function"], qKnowledgeGradient):
+            # BoTorch cannot run one-shot KG sequentially; build the batch greedily with X_pending instead.
+            return self._optimize_acqf_sequential_greedy(optimization_constraints, **kwargs)
         if not self._has_nonlinear_constraints(optimization_constraints):
             return self._optimize_acqf(**kwargs, **self._optimization_constraint_kwargs(optimization_constraints))
         if kwargs["q"] > 1 and (
@@ -1167,6 +1345,29 @@ class DeepoptBaseModel(ABC):
             return result
         raise RuntimeError("Unreachable nonlinear acquisition optimization retry state.")
 
+    def _optimize_acqf_sequential_greedy(
+        self,
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Greedy sequential q-batch construction with ``X_pending`` for any acquisition supporting it."""
+        acq_function = kwargs["acq_function"]
+        base_X_pending = getattr(acq_function, "X_pending", None)
+        candidate_list, acq_value_list = [], []
+        try:
+            for _ in range(kwargs["q"]):
+                step_kwargs = dict(kwargs, q=1, sequential=False)
+                candidate, acq_value = self._optimize_acqf_constrained(optimization_constraints, **step_kwargs)
+                candidate_list.append(candidate)
+                acq_value_list.append(acq_value.reshape(()))
+                candidates = torch.cat(candidate_list, dim=-2)
+                acq_function.set_X_pending(
+                    torch.cat([base_X_pending, candidates], dim=-2) if base_X_pending is not None else candidates
+                )
+        finally:
+            acq_function.set_X_pending(base_X_pending)
+        return torch.cat(candidate_list, dim=-2), torch.stack(acq_value_list)
+
     def _optimize_acqf_nonlinear_sequential(
         self,
         optimization_constraints: AcquisitionOptimizationConstraints,
@@ -1203,6 +1404,134 @@ class DeepoptBaseModel(ABC):
         if self._has_nonlinear_constraints(optimization_constraints):
             raise NotImplementedError("Nonlinear inequality constraints are not supported for multi-fidelity mixed optimization.")
         return self._optimize_acqf_mixed(**kwargs, **self._optimization_constraint_kwargs(optimization_constraints))
+
+    def _resolve_sequential(self, acq_method: str, settings: AcquisitionOptimizationSettings, multi_fidelity: bool = False) -> bool:
+        """
+        Map ``batch_mode`` to the ``sequential`` flag for a q-batch.
+
+        ``'default'`` keeps the historical rules: MaxValEntropy/GIBBON are sequential, EI/NEI/KG are
+        joint in single-fidelity runs, and multi-fidelity mixed optimization is always sequential.
+        """
+        if settings.acq_optimizer == "boltzmann":
+            if settings.batch_mode != "default":
+                warnings.warn(
+                    "batch_mode is ignored by acq_optimizer='boltzmann', which always draws i.i.d. batch members.",
+                    RuntimeWarning,
+                )
+            return False
+        if settings.batch_mode == "joint":
+            if acq_method in ("MaxValEntropy", "GIBBON"):
+                raise ValueError(f"batch_mode='joint' is not supported for {acq_method}, whose value is pointwise; use 'sequential'.")
+            if multi_fidelity:
+                raise NotImplementedError("batch_mode='joint' is not supported for multi-fidelity runs; use 'sequential'.")
+            return False
+        if settings.batch_mode == "sequential" or multi_fidelity:
+            return True
+        return acq_method in ("MaxValEntropy", "GIBBON")
+
+    def _sampled_kg_inner_set(
+        self,
+        model: Type[Model],
+        settings: AcquisitionOptimizationSettings,
+        bounds: torch.Tensor,
+        value_acqf: Any,
+        fixed_features_list: Optional[List[Dict[int, float]]],
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+    ) -> torch.Tensor:
+        """
+        Shared discrete inner set for gradient-free KG.
+
+        It combines posterior-mean elites from a scoped search, the (feasible) training
+        inputs, and feasible Sobol points, about ``kg_inner_set_size`` points in total.
+        Multi-fidelity inner sets are pinned to the target fidelity.
+        """
+        sampling_options = SamplingOptions.from_settings(settings)
+        constraint_kwargs = self._optimization_constraint_kwargs(optimization_constraints)
+        constraint_kwargs = {
+            key: constraint_kwargs[key]
+            for key in ("inequality_constraints", "equality_constraints", "nonlinear_inequality_constraints")
+            if key in constraint_kwargs
+        }
+        size = settings.kg_inner_set_size
+        n_elites = max(1, size // 4)
+        elites = search_elites(
+            value_acqf, bounds, n_elites, sampling_options, self.random_seed + 17,
+            fixed_features_list=fixed_features_list, **constraint_kwargs,
+        )
+        space = SearchSpace(bounds=bounds, fixed_features_list=fixed_features_list, **constraint_kwargs)
+        train_X = self.full_train_X.to(bounds)
+        if fixed_features_list:
+            train_X = space.to_x(space.to_u(train_X))
+        train_X = train_X[space.feasible(train_X)]
+        n_sobol = max(0, size - elites.shape[0] - train_X.shape[0])
+        parts = [elites, train_X]
+        if n_sobol > 0:
+            parts.append(draw_feasible_points(
+                bounds, n_sobol, self.random_seed + 29, fixed_features_list=fixed_features_list, **constraint_kwargs
+            ))
+        return torch.cat(parts).detach()
+
+    def _sampled_kg_inner_search(
+        self,
+        settings: AcquisitionOptimizationSettings,
+        bounds: torch.Tensor,
+        fixed_features_list: Optional[List[Dict[int, float]]],
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+    ) -> Callable[..., torch.Tensor]:
+        """Per-fantasy scoped maximization used to refine the final gradient-free KG candidates."""
+        sampling_options = SamplingOptions.from_settings(settings).for_kg_outer()
+        constraint_kwargs = self._optimization_constraint_kwargs(optimization_constraints)
+        inequality_constraints = constraint_kwargs.get("inequality_constraints")
+        nonlinear_constraints = constraint_kwargs.get("nonlinear_inequality_constraints")
+        if constraint_kwargs.get("equality_constraints"):
+            warnings.warn("Gradient-free KG refinement ignores equality constraints; the discrete inner set still respects them.", RuntimeWarning)
+
+        def inner_search(value_fn: Callable[[torch.Tensor], torch.Tensor], inner_bounds: torch.Tensor, n_fantasies: int) -> torch.Tensor:
+            return batched_max_search(
+                value_fn, inner_bounds, n_fantasies, sampling_options, self.random_seed + 31,
+                fixed_features_list=fixed_features_list,
+                inequality_constraints=inequality_constraints,
+                nonlinear_inequality_constraints=nonlinear_constraints,
+            )
+
+        return inner_search
+
+    def _make_sampled_kg(
+        self,
+        model: Type[Model],
+        settings: AcquisitionOptimizationSettings,
+        bounds: torch.Tensor,
+        current_value: torch.Tensor,
+        risk_objective: Optional[Type[RiskMeasureMCObjective]],
+        risk_n_deltas: Optional[int],
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+        cost_aware_utility: Optional[InverseCostWeightedUtility] = None,
+    ) -> SampledKnowledgeGradient:
+        """Build the gradient-free KG used when ``acq_optimizer`` is not ``'gradient'``."""
+        n_fantasies = settings.n_fantasies
+        fixed_features_list = None
+        project = None
+        if self.multi_fidelity:
+            fixed_features_list = [{self.input_dim - 1: float(self.num_fidelities - 1)}]
+            project = self._project
+        value_acqf = PosteriorMean(
+            model,
+            posterior_transform=ExpectationPosteriorTransform(n_w=risk_n_deltas) if risk_objective else None,
+        )
+        inner_set = self._sampled_kg_inner_set(model, settings, bounds, value_acqf, fixed_features_list, optimization_constraints)
+        return SampledKnowledgeGradient(
+            model=model,
+            inner_set=inner_set,
+            sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+            inner_sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+            current_value=current_value,
+            objective=risk_objective,
+            cost_aware_utility=cost_aware_utility,
+            project=project,
+            inner_bounds=bounds,
+            inner_search=self._sampled_kg_inner_search(settings, bounds, fixed_features_list, optimization_constraints),
+            eval_batch=max(1, settings.sampling_eval_batch // max(1, n_fantasies)),
+        )
 
     def _fixed_feature_subproblem_constraints(
         self,
@@ -1271,6 +1600,24 @@ class DeepoptBaseModel(ABC):
         :returns: ``(candidates, acq_value)`` in scaled model coordinates.
         """
         settings = self._resolve_optimization_settings(optimization_settings)
+        with self._using_optimization_settings(settings):
+            return self._get_candidates_mf_impl(
+                model, acq_method, q, fidelity_cost, risk_objective, risk_n_deltas, settings, propose_best,
+                optimization_constraints,
+            )
+
+    def _get_candidates_mf_impl(
+        self,
+        model: Type[Model],
+        acq_method: str,
+        q: int,
+        fidelity_cost: np.ndarray,
+        risk_objective: Optional[Type[RiskMeasureMCObjective]],
+        risk_n_deltas: Optional[int],
+        settings: AcquisitionOptimizationSettings,
+        propose_best: Optional[bool],
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
         bounds[1, -1] = self.num_fidelities - 1
@@ -1339,11 +1686,13 @@ class DeepoptBaseModel(ABC):
                     candidate_set=candidate_set,
                     seed=self.random_seed,
                 )
-            candidates, acq_value = self._optimize_acqf_mixed_constrained(
+            candidates, acq_value = self._optimize_mf_batch(
                 acq_function=q_acq,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
+                acq_method=acq_method,
+                settings=settings,
                 num_restarts=settings.num_restarts_high,
                 raw_samples=settings.raw_samples_high,
                 options=self._make_constrained_acq_options(
@@ -1384,21 +1733,35 @@ class DeepoptBaseModel(ABC):
                 )
             
 
-            mfkg_acqf = qMultiFidelityKnowledgeGradient(
-                model=model,
-                num_fantasies=n_fantasies,
-                sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
-                inner_sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
-                current_value=max_pmean,
-                cost_aware_utility=cost_aware_utility,
-                project=self._project,
-                objective=risk_objective,
-            )
-            candidates, acq_value = self._optimize_acqf_mixed_constrained(
+            if settings.acq_optimizer == "gradient":
+                mfkg_acqf = qMultiFidelityKnowledgeGradient(
+                    model=model,
+                    num_fantasies=n_fantasies,
+                    sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+                    inner_sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+                    current_value=max_pmean,
+                    cost_aware_utility=cost_aware_utility,
+                    project=self._project,
+                    objective=risk_objective,
+                )
+            else:
+                mfkg_acqf = self._make_sampled_kg(
+                    model=model,
+                    settings=settings,
+                    bounds=bounds,
+                    current_value=max_pmean,
+                    risk_objective=risk_objective,
+                    risk_n_deltas=risk_n_deltas,
+                    optimization_constraints=optimization_constraints,
+                    cost_aware_utility=cost_aware_utility,
+                )
+            candidates, acq_value = self._optimize_mf_batch(
                 acq_function=mfkg_acqf,
                 bounds=bounds,
                 fixed_features_list=[{self.input_dim - 1: i} for i in range(self.num_fidelities)],
                 q=q,
+                acq_method=acq_method,
+                settings=settings,
                 num_restarts=settings.num_restarts_low,
                 raw_samples=settings.raw_samples_low,
                 options=self._make_constrained_acq_options(
@@ -1408,12 +1771,56 @@ class DeepoptBaseModel(ABC):
                 ),
                 optimization_constraints=optimization_constraints,
             )
+        else:
+            raise ValueError(f"Unsupported multi-fidelity acquisition method {acq_method}. Options: 'KG', 'MaxValEntropy', or 'GIBBON'.")
         if propose_best:
             best_candidate = torch.concat([best_candidate.reshape(1,-1),(self.num_fidelities-1)*torch.ones(1,1,device=self.device)],axis=1)
             candidates = torch.concat([best_candidate,candidates],axis=0)
 
         print(f"{acq_value = }")
         return candidates, acq_value
+
+    def _optimize_mf_batch(
+        self,
+        acq_method: str,
+        settings: AcquisitionOptimizationSettings,
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints] = None,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Multi-fidelity mixed optimization honoring ``batch_mode`` (sequential only) and gradient-free optimizers."""
+        sequential = self._resolve_sequential(acq_method, settings, multi_fidelity=True)
+        if settings.acq_optimizer != "gradient":
+            # Gradient-free mixed search handles the fidelity choice inside one search space.
+            return self._optimize_acqf_mixed_constrained(
+                optimization_constraints=optimization_constraints, sequential=sequential, **kwargs
+            )
+        if kwargs["q"] > 1 and isinstance(kwargs["acq_function"], qKnowledgeGradient) and settings.batch_mode == "sequential":
+            return self._optimize_mixed_sequential_greedy(optimization_constraints, **kwargs)
+        return self._optimize_acqf_mixed_constrained(optimization_constraints=optimization_constraints, **kwargs)
+
+    def _optimize_mixed_sequential_greedy(
+        self,
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Greedy multi-fidelity batch for one-shot KG (BoTorch's mixed optimizer evaluates KG jointly otherwise)."""
+        acq_function = kwargs["acq_function"]
+        base_X_pending = getattr(acq_function, "X_pending", None)
+        candidate_list, acq_value_list = [], []
+        try:
+            for _ in range(kwargs["q"]):
+                candidate, acq_value = self._optimize_acqf_mixed_constrained(
+                    optimization_constraints=optimization_constraints, **dict(kwargs, q=1)
+                )
+                candidate_list.append(candidate)
+                acq_value_list.append(acq_value.reshape(()))
+                candidates = torch.cat(candidate_list, dim=-2)
+                acq_function.set_X_pending(
+                    torch.cat([base_X_pending, candidates], dim=-2) if base_X_pending is not None else candidates
+                )
+        finally:
+            acq_function.set_X_pending(base_X_pending)
+        return torch.cat(candidate_list, dim=-2), torch.stack(acq_value_list)
 
     def _get_candidates_sf(
         self,
@@ -1440,9 +1847,29 @@ class DeepoptBaseModel(ABC):
         :returns: ``(candidates, acq_value)`` in scaled model coordinates.
         """
         settings = self._resolve_optimization_settings(optimization_settings)
+        with self._using_optimization_settings(settings):
+            return self._get_candidates_sf_impl(
+                model, acq_method, q, risk_objective, risk_n_deltas, settings, propose_best, optimization_constraints
+            )
+
+    def _get_candidates_sf_impl(
+        self,
+        model: Type[Model],
+        acq_method: str,
+        q: int,
+        risk_objective: Optional[Type[RiskMeasureMCObjective]],
+        risk_n_deltas: Optional[int],
+        settings: AcquisitionOptimizationSettings,
+        propose_best: Optional[bool],
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+    ) -> Tuple[Any, Any]:
         n_fantasies = settings.n_fantasies
         bounds = torch.tensor(self.input_dim * [[0, 1]],dtype=torch.float,device=self.device).T
-        if acq_method == "KG" and self._has_nonlinear_constraints(optimization_constraints):
+        if (
+            acq_method == "KG"
+            and self._has_nonlinear_constraints(optimization_constraints)
+            and settings.acq_optimizer == "gradient"
+        ):
             raise NotImplementedError("Nonlinear constraints are not supported with KG acquisition optimization.")
 
         if propose_best:
@@ -1505,14 +1932,27 @@ class DeepoptBaseModel(ABC):
                     optimization_constraints=optimization_constraints,
                 )
             
-            q_acq = qKnowledgeGradient(
-                model=model,
-                num_fantasies=n_fantasies,
-                sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
-                inner_sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
-                current_value=max_pmean,
-                objective=risk_objective,
-            )
+            if settings.acq_optimizer == "gradient":
+                q_acq = qKnowledgeGradient(
+                    model=model,
+                    num_fantasies=n_fantasies,
+                    sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+                    inner_sampler=make_sobol_qmc_normal_sampler(n_fantasies, seed=self.random_seed),
+                    current_value=max_pmean,
+                    objective=risk_objective,
+                )
+            else:
+                q_acq = self._make_sampled_kg(
+                    model=model,
+                    settings=settings,
+                    bounds=bounds,
+                    current_value=max_pmean,
+                    risk_objective=risk_objective,
+                    risk_n_deltas=risk_n_deltas,
+                    optimization_constraints=optimization_constraints,
+                )
+        else:
+            raise ValueError(f"Unsupported acquisition method {acq_method}. Options: 'EI', 'NEI', 'KG', or 'MaxValEntropy'.")
         is_expensive_acq = acq_method in ["MaxValEntropy", "KG"]
         candidates, acq_value = self._optimize_acqf_constrained(
             acq_function=q_acq,
@@ -1520,7 +1960,7 @@ class DeepoptBaseModel(ABC):
             q=q,
             num_restarts=settings.num_restarts_low if is_expensive_acq else settings.num_restarts_high,
             raw_samples=settings.raw_samples_low if is_expensive_acq else settings.raw_samples_high,
-            sequential=(acq_method == "MaxValEntropy"),
+            sequential=self._resolve_sequential(acq_method, settings),
             options=self._make_constrained_acq_options(
                 settings.batch_limit_low if is_expensive_acq else settings.batch_limit_high,
                 settings.maxiter,
@@ -1572,12 +2012,48 @@ class DeepoptBaseModel(ABC):
         current_max = self.full_train_Y[self.full_train_X[:,-1]==(self.num_fidelities-1)].max(
             ) if self.multi_fidelity else self.full_train_Y.max()
         print(f"Number of simulations: {len(self.full_train_X)}. Current max: {current_max.item():.5f}")
-        if self.config_settings.get_setting("model_type") == "TabPFN":
+        settings = self._resolve_optimization_settings(optimization_settings)
+        model_type = self.config_settings.get_setting("model_type")
+        if model_type == "TabPFN":
             if acq_method == "KG":
                 raise NotImplementedError("KG acquisition requires model fantasizing, which TabPFN does not currently support.")
             if acq_method == "MaxValEntropy" and q > 1:
                 raise NotImplementedError("TabPFN MaxValEntropy currently supports only one candidate at a time.")
+        if not getattr(model, "supports_gradients", True):
+            if settings.acq_optimizer == "gradient":
+                raise ValueError(
+                    f"The {model_type} surrogate is not differentiable, so it cannot be used with the gradient-based "
+                    "acquisition optimizer. Choose a gradient-free optimizer with --acq-optimizer sampling or "
+                    "--acq-optimizer boltzmann (config: optimization.acq_optimizer)."
+                )
+            if acq_method == "GIBBON":
+                raise NotImplementedError(f"GIBBON requires a GPyTorch model and is not supported with the {model_type} surrogate.")
 
+        with self._using_optimization_settings(settings):
+            return self._dispatch_candidates(
+                model=model,
+                acq_method=acq_method,
+                q=q,
+                risk_objective=risk_objective,
+                risk_n_deltas=risk_n_deltas,
+                fidelity_cost=fidelity_cost,
+                optimization_settings=settings,
+                propose_best=propose_best,
+                optimization_constraints=optimization_constraints,
+            )
+
+    def _dispatch_candidates(
+        self,
+        model: Type[Model],
+        acq_method: str,
+        q: int,
+        risk_objective: Optional[Type[RiskMeasureMCObjective]],
+        risk_n_deltas: Optional[int],
+        fidelity_cost: Optional[np.ndarray],
+        optimization_settings: AcquisitionOptimizationSettings,
+        propose_best: bool,
+        optimization_constraints: Optional[AcquisitionOptimizationConstraints],
+    ) -> Tuple[Any, Any]:
         if self.multi_fidelity:
             candidates, acq_value = self._get_candidates_mf(
                 model=model,
@@ -1627,6 +2103,8 @@ class DeepoptBaseModel(ABC):
         nonlinear_initial_raw_samples: Optional[int] = None,
         nonlinear_initial_max_tries: Optional[int] = None,
         nonlinear_optimization_retries: Optional[int] = None,
+        acq_optimizer: Optional[str] = None,
+        batch_mode: Optional[str] = None,
     ) -> None:
         """
         Propose candidates from a trained checkpoint and save them as a NumPy array.
@@ -1665,8 +2143,19 @@ class DeepoptBaseModel(ABC):
         :param nonlinear_initial_raw_samples: Optional raw samples for nonlinear-feasible starts; defaults to config.
         :param nonlinear_initial_max_tries: Maximum attempts to find nonlinear-feasible starts; defaults to config.
         :param nonlinear_optimization_retries: Additional retries after nonlinear optimizer failure warnings; defaults to config.
+        :param acq_optimizer: ``'gradient'``, ``'sampling'``, or ``'boltzmann'``; overrides ``optimization.acq_optimizer``.
+        :param batch_mode: ``'default'``, ``'sequential'``, or ``'joint'``; overrides ``optimization.batch_mode``.
         """
         optimization_settings = self._resolve_optimization_settings(optimization_settings)
+        overrides = {
+            key: value
+            for key, value in (("acq_optimizer", acq_optimizer), ("batch_mode", batch_mode))
+            if value is not None
+        }
+        if overrides:
+            merged = dict(optimization_settings.__dict__)
+            merged.update(overrides)
+            optimization_settings = self._validate_optimization_settings(merged)
         optimization_constraints = self._normalize_optimization_constraints(
             optimization_constraints=optimization_constraints,
             inequality_constraints=inequality_constraints,
@@ -1690,6 +2179,8 @@ class DeepoptBaseModel(ABC):
             Random Seed: {self.random_seed}
             Bounds: {self.bounds}
             Acq Method: {acq_method}
+            Acq Optimizer: {optimization_settings.acq_optimizer}
+            Batch Mode: {optimization_settings.batch_mode}
             Model Type: {self.config_settings.get_setting("model_type")}
             Multi-Fidelity: {self.multi_fidelity}
             Fidelity Cost: {fidelity_cost}
@@ -2249,3 +2740,61 @@ class NNEnsembleModel(DeepoptBaseModel):
         dir_name = dirname(learner_file)
         model.load_ckpt(dir_name, file_name)
         return model
+
+
+class RFModel(DeepoptBaseModel):
+    """
+    DeepOpt wrapper for scikit-learn random forest surrogates.
+
+    Random forests are not differentiable, so candidate generation requires a
+    gradient-free acquisition optimizer (``--acq-optimizer sampling`` or
+    ``boltzmann``). Checkpoints store only scalers, settings, and training data;
+    the forest is refit deterministically from ``random_seed`` on load.
+    """
+
+    def _make_rf(self) -> RandomForestSurrogate:
+        return RandomForestSurrogate(
+            config=self.config_settings,
+            X_train=self.full_train_X,
+            y_train=self.full_train_Y_scaled,
+            multi_fidelity=self.multi_fidelity,
+            seed=self.random_seed,
+            device=self.device,
+            output_scaler=self.output_scaler,
+            input_scaler=self.input_scaler,
+        )
+
+    def train(self, outfile: str) -> RandomForestSurrogate:
+        """
+        Fit the random forest surrogate and save a lightweight DeepOpt checkpoint.
+
+        :param outfile: Checkpoint path.
+        :returns: The fitted ``RandomForestSurrogate``.
+        """
+        print("Training Random Forest Surrogate.")
+        model = self._make_rf()
+        state = {
+            "input_scaler": self.input_scaler.state_dict(),
+            "output_scaler": self.output_scaler.state_dict(),
+            "rf_backend": {"refit_on_load": True},
+            DEEPOPT_CHECKPOINT_KEY: self._checkpoint_metadata(),
+        }
+        self.learner_file = join(getcwd(), dirname(outfile), basename(outfile))
+        torch.save(state, self.learner_file)
+        return model
+
+    def load_model(self, learner_file: str) -> RandomForestSurrogate:
+        """
+        Rebuild the random forest surrogate from a DeepOpt checkpoint by refitting it.
+
+        :param learner_file: Checkpoint path produced by ``train``.
+        :returns: The refit ``RandomForestSurrogate``.
+        """
+        state = _torch_load(learner_file, map_location=self.device)
+        if "input_scaler" in state:
+            self.input_scaler = InputScaler.from_state_dict(state["input_scaler"], device=self.device)
+            self.full_train_X = self.input_scaler.transform(self.X_orig).to(self.device)
+        if "output_scaler" in state:
+            self.output_scaler = OutputScaler.from_state_dict(state["output_scaler"], device=self.device)
+            self.full_train_Y_scaled = self.output_scaler.transform(self.full_train_Y, self.full_train_X)
+        return self._make_rf()
